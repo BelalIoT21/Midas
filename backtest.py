@@ -25,9 +25,6 @@ from config import (
     ATR_SL_MULT, ATR_TP1_MULT, ATR_TP2_MULT,
     MIN_CONFIDENCE, MIN_RR_RATIO,
 )
-# Print active config for validation
-print(f"  [config] MIN_CONF={MIN_CONFIDENCE}  SL={ATR_SL_MULT}x  "
-      f"TP1={ATR_TP1_MULT}x  TP2={ATR_TP2_MULT}x  RR1=1:{ATR_TP1_MULT/ATR_SL_MULT:.2f}")
 from indicators.calculator import compute_votes, atr_value, supertrend_vote
 from indicators.levels import all_levels, nearest_level
 from analysis.sessions import (
@@ -436,6 +433,8 @@ def run_backtest() -> None:
     print(f"\n{'='*58}")
     print(f"  MIDAS BACKTEST  —  15min  —  Trump Era (Jan 2025+)")
     print(f"  XAUUSD  |  {START_DATE.date()} to today")
+    print(f"  [config] MIN_CONF={MIN_CONFIDENCE}  SL={ATR_SL_MULT}x  "
+          f"TP1={ATR_TP1_MULT}x  TP2={ATR_TP2_MULT}x  RR1=1:{ATR_TP1_MULT/ATR_SL_MULT:.2f}")
     print(f"{'='*58}\n")
 
     # Fetch base 15min data (includes warmup window)

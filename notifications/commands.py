@@ -550,20 +550,16 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{'━'*30}",
         ]
 
-        # Session gate check
+        # Session gate check — only Sunday is a hard stop; all other hours still show analysis
         if is_sunday:
             lines.append("⏸ Sunday — no trading. BTC resumes Monday, Gold resumes Monday.")
             await msg.edit_text("\n".join(lines), parse_mode="HTML")
             return
-        if symbol == "BTC/USD" and not is_btc_session(now):
-            lines.append("⏸ Outside BTC trading window (avoid 02:00–06:00 UTC)")
-            await msg.edit_text("\n".join(lines), parse_mode="HTML")
-            return
         if symbol == "XAU/USD" and not is_gold_session(now):
-            lines.append(
-                "⏸ Outside Gold trading window (Mon–Fri 08:00–21:00 UTC)\n"
-                "Asia session (00:00–08:00 UTC) is active — marking levels only."
-            )
+            if 0 <= now.hour < 8:
+                lines.append("🌏 <b>Asia session</b> — marking levels, no entries yet (trading opens 08:00 UTC)")
+            else:
+                lines.append("⏸ Outside Gold trading window (entries: Mon–Fri 08:00–21:00 UTC)")
 
         # Fetch candles
         try:
@@ -584,11 +580,17 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         result = analyze_snapshot(candles, symbol=symbol)
         step   = result["step"]
 
+        try:
+            from config import FAKEOUT_ZONE_LEVEL
+            fakeout_label = f"In fakeout zone ({FAKEOUT_ZONE_LEVEL:.3f})"
+        except Exception:
+            fakeout_label = "In fakeout zone"
+
         step_labels = [
             ("4H Fractal BoS",              result["bias"] != 0),
             ("Asia level marked",            result["asia_level"] is not None),
             ("Asia level swept",             result["sweep"] is not None),
-            ("In fakeout zone (0.079)",      result["fakeout"]),
+            (fakeout_label,                  result["fakeout"]),
             ("5min BoS confirmed",           result["bos"] is not None),
             ("In Goldilocks zone (0.236–0.764)", result["signal"] is not None),
         ]

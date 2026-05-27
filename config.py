@@ -18,13 +18,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 # ── Timeframes fetched per scan ────────────────────────────────────────────────
-# 4H for bias, 5min for entry logic
+# 4H for bias, 5min for entry logic.
+# Second value is the outputsize passed to TwelveData for that interval.
+# 5min needs 300 candles = 25 hours so Asia data (00:00 UTC) is always present
+# even when scanning late in the day (e.g. 20:00 UTC = 240 candles back).
 TIMEFRAMES = [
     ("4h",    50),
     ("1h",    50),
-    ("5min", 200),
+    ("5min", 300),
 ]
-CANDLE_COUNT = 200
+CANDLE_COUNT = 300
 
 # ── Tap 'n' Barrel strategy settings ──────────────────────────────────────────
 # Scan interval: 5 min (fast enough to catch entries but stays within API limits)
@@ -120,7 +123,18 @@ ENTRY_RR          = float(os.getenv("ENTRY_RR",          "2.0"))   # TP = 2×SL
 ENTRY_SL_FIB      = float(os.getenv("ENTRY_SL_FIB",      "1.1"))   # SL fib level
 ENTRY_ZONE_DEEP   = float(os.getenv("ENTRY_ZONE_DEEP",   "0.764")) # deep end of entry zone (was 0.618)
 ENTRY_ZONE_SHALLOW= float(os.getenv("ENTRY_ZONE_SHALLOW","0.236")) # shallow end (was 0.382)
-SWEEP_TOLERANCE   = float(os.getenv("SWEEP_TOLERANCE",   "0.003")) # 0.3% — near-miss sweep counts
+SWEEP_TOLERANCE   = float(os.getenv("SWEEP_TOLERANCE",   "0.005")) # 0.5% — near-miss sweep counts (was 0.003)
+# Fakeout zone level: how far from the pre-sweep extreme price must retrace after a sweep.
+# 0.079 = just below/above the swing extreme (7.9% of range — very tight, requires full recovery)
+# 0.382 = standard fib retrace (61.8% of range — much more realistic in live markets)
+FAKEOUT_ZONE_LEVEL = float(os.getenv("FAKEOUT_ZONE_LEVEL", "0.382"))
+
+# ── Backtest / scoring parameters ─────────────────────────────────────────────
+ATR_SL_MULT    = float(os.getenv("ATR_SL_MULT",    "1.5"))
+ATR_TP1_MULT   = float(os.getenv("ATR_TP1_MULT",   "2.25"))
+ATR_TP2_MULT   = float(os.getenv("ATR_TP2_MULT",   "3.0"))
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.68"))
+MIN_RR_RATIO   = float(os.getenv("MIN_RR_RATIO",   "1.5"))
 
 # ── News blackout windows (UTC) ────────────────────────────────────────────────
 # Format: list of "HH:MM-HH:MM" strings. Loaded from NEWS_BLACKOUT env var as

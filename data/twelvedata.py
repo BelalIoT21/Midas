@@ -173,15 +173,32 @@ def fetch_price(symbol: str = SYMBOL) -> float | None:
     return None
 
 
-def fetch_all_timeframes(timeframes: list[tuple], symbol: str = SYMBOL) -> dict[str, pd.DataFrame]:
+def fetch_all_timeframes(
+    timeframes: list[tuple],
+    symbol: str = SYMBOL,
+    account: dict | None = None,
+) -> dict[str, pd.DataFrame]:
     """
     Fetch candles for all timeframes. Returns {interval: DataFrame}.
-    Skips timeframes that fail (logs the error).
+
+    account: if provided (OANDA credentials dict with 'password' and 'server' keys),
+      fetches from OANDA — no daily credit limit.  Falls back to TwelveData on error.
+      Pass account from the trading loops; omit for Telegram display commands.
     """
+    if account:
+        api_key  = account.get("password", "")
+        env_flag = account.get("server", "practice")
+        if api_key:
+            try:
+                from data.oanda_candles import fetch_all_timeframes as _oanda
+                return _oanda(timeframes, symbol, api_key, env_flag)
+            except Exception as e:
+                logger.warning(f"[data] OANDA candle fetch failed, falling back to TwelveData: {e}")
+
     result = {}
-    for interval, _weight in timeframes:
+    for interval, outputsize in timeframes:
         try:
-            result[interval] = fetch_candles(interval, symbol=symbol)
+            result[interval] = fetch_candles(interval, outputsize=outputsize, symbol=symbol)
             print(f"[data] {symbol} {interval}: {len(result[interval])} candles loaded")
         except Exception as e:
             print(f"[data] WARNING: failed to fetch {symbol} {interval} — {e}")

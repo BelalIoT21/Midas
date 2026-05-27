@@ -9,7 +9,9 @@ import pandas as pd
 import pandas_ta as ta
 
 
-def _safe(series: pd.Series) -> float | None:
+def _safe(series) -> float | None:
+    if series is None:
+        return None
     s = series.dropna()
     return float(s.iloc[-1]) if not s.empty else None
 

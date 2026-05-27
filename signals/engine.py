@@ -222,6 +222,7 @@ def find_sweep(
             fib_low  = float(row["low"])
             return {
                 "idx":          i,
+                "sweep_time":   df_5m.index[i],   # UTC timestamp — survives candle re-fetches
                 "sweep_price":  fib_low,
                 "fib_high":     fib_high,
                 "fib_low":      fib_low,
@@ -234,6 +235,7 @@ def find_sweep(
             fib_high = float(row["high"])
             return {
                 "idx":          i,
+                "sweep_time":   df_5m.index[i],   # UTC timestamp — survives candle re-fetches
                 "sweep_price":  fib_high,
                 "fib_high":     fib_high,
                 "fib_low":      fib_low,
@@ -264,22 +266,86 @@ def in_fakeout_zone(
     bias: int,
 ) -> bool:
     """
-    Price must have bounced back to the 0.079 fib zone after the sweep.
-    0.079 zone = near the TOP of the fib range (price retraced most of the drop).
+    Price must have bounced back to the fakeout zone after the sweep.
+
+    The fakeout zone level is read from config (FAKEOUT_ZONE_LEVEL, default 0.382):
+      - Fib convention: 0 = top (fib_high), 1 = bottom (fib_low)
+      - FAKEOUT_ZONE_LEVEL = 0.382 means price must retrace 61.8% of the sweep range
+        (i.e. reach the level that is 38.2% below the pre-sweep high)
+
+    Both bullish and bearish use the same retracement requirement (symmetric):
+      - Bullish: after sweeping DOWN below Asia low, price must bounce UP into the zone
+        (price >= fib_high - level * range)
+      - Bearish: after sweeping UP above Asia high, price must fall DOWN into the zone
+        (price <= fib_low + level * range)
     """
     if fib_high <= fib_low:
         return False
+
+    try:
+        from config import FAKEOUT_ZONE_LEVEL
+        level = FAKEOUT_ZONE_LEVEL
+    except Exception:
+        level = 0.382
+
     fib_range = fib_high - fib_low
-    zone_top    = fib_price(fib_high, fib_low, 0.0)    # = fib_high
-    zone_bottom = fib_price(fib_high, fib_low, 0.079)  # just below the high
-    # For bullish: price must be at or above the 0.079 level
+
     if bias == 1:
+        # Bullish: price must bounce UP from the sweep low to at least (fib_high - level * range)
+        zone_bottom = fib_price(fib_high, fib_low, level)   # e.g. 0.382 level from top
         return current_price >= zone_bottom
-    # For bearish: fib is inverted (low is the origin)
-    # zone_bottom from bearish perspective
-    zone_top_bear    = fib_low + fib_range * 1.0       # = fib_high
-    zone_bottom_bear = fib_low + fib_range * 0.921     # 1.0 - 0.079
-    return current_price <= zone_bottom_bear
+    else:
+        # Bearish: price must fall DOWN from the sweep high to at most (fib_low + level * range)
+        # Symmetric with bullish — requires the same proportional retrace
+        zone_top_bear = fib_low + level * fib_range         # e.g. 38.2% above fib_low
+        return current_price <= zone_top_bear
+
+
+# ── Step 4b: Historical fakeout zone scan ────────────────────────────────────
+
+def scan_fakeout_zone(
+    df_5m: pd.DataFrame,
+    sweep: dict,
+    bias: int,
+) -> bool:
+    """
+    Return True if ANY bar since the sweep entered the fakeout zone.
+
+    Unlike in_fakeout_zone() which checks a single price, this scans the full
+    candle history from the sweep bar forward.  This lets the bot bootstrap
+    correctly when /trade is started mid-day and the fakeout bounce already
+    happened earlier — instead of waiting forever for a zone entry that passed.
+    """
+    fib_high = sweep["fib_high"]
+    fib_low  = sweep["fib_low"]
+    if fib_high <= fib_low:
+        return False
+
+    sweep_time = sweep.get("sweep_time")
+    if sweep_time is not None:
+        bars = df_5m[df_5m.index >= pd.Timestamp(sweep_time)]
+    else:
+        bars = df_5m.iloc[sweep.get("idx", 0):]
+
+    if bars.empty:
+        return False
+
+    try:
+        from config import FAKEOUT_ZONE_LEVEL
+        level = FAKEOUT_ZONE_LEVEL
+    except Exception:
+        level = 0.382
+
+    fib_range = fib_high - fib_low
+
+    if bias == 1:
+        # Bullish: any candle HIGH reached the zone ceiling
+        zone_bottom = fib_high - level * fib_range
+        return bool((bars["high"] >= zone_bottom).any())
+    else:
+        # Bearish: any candle LOW reached the zone floor
+        zone_top = fib_low + level * fib_range
+        return bool((bars["low"] <= zone_top).any())
 
 
 # ── Step 5: 5min Fractal Break of Structure ───────────────────────────────────
@@ -288,17 +354,34 @@ def find_5min_bos(
     df_5m: pd.DataFrame,
     bias: int,
     start_idx: int = 0,
+    *,
+    start_time=None,
 ) -> Optional[dict]:
     """
     Scan bars from start_idx for a 5min fractal BoS in bias direction.
     BODY close required (wick only = invalid).
+
+    start_time: if provided (a UTC Timestamp from sweep["sweep_time"]), resolves the
+      correct start_idx regardless of how many new candles have been fetched since the
+      sweep was first detected — this avoids the iloc-drift bug.
 
     Returns dict with:
       idx           – iloc index of the BoS bar
       swing_high    – the fractal that was broken (bullish) or swing high of move (bearish)
       swing_low     – swing low of the BoS move (bullish) or the fractal that broke (bearish)
     """
-    if df_5m is None or len(df_5m) < start_idx + 10:
+    if df_5m is None or df_5m.empty:
+        return None
+
+    if start_time is not None:
+        sweep_ts = pd.Timestamp(start_time)
+        after    = df_5m.index >= sweep_ts
+        if after.any():
+            start_idx = int(after.argmax())
+        else:
+            return None
+
+    if len(df_5m) < start_idx + 10:
         return None
 
     window = df_5m.iloc[start_idx:]
@@ -517,18 +600,30 @@ def analyze_snapshot(
         return result
     result["step"] = 3
 
-    # Step 4 — fakeout zone
-    current_price = float(df_5m["close"].iloc[-1])
-    fakeout = in_fakeout_zone(current_price, sweep["fib_high"], sweep["fib_low"], bias)
+    # Step 4 — fakeout zone: scan ALL bars since the sweep so mid-day starts
+    # correctly detect a fakeout bounce that already occurred.
+    fakeout = scan_fakeout_zone(df_5m, sweep, bias)
     result["fakeout"] = fakeout
     if not fakeout:
-        fib_079 = fib_price(sweep["fib_high"], sweep["fib_low"], 0.079)
-        result["reason"] = f"Waiting for price to return to 0.079 fakeout zone ({fib_079:.2f})"
+        try:
+            from config import FAKEOUT_ZONE_LEVEL
+            level = FAKEOUT_ZONE_LEVEL
+        except Exception:
+            level = 0.382
+        fib_zone = fib_price(sweep["fib_high"], sweep["fib_low"], level)
+        current_check = (
+            float(df_5m["high"].iloc[-1]) if bias == 1
+            else float(df_5m["low"].iloc[-1])
+        )
+        result["reason"] = (
+            f"Waiting for price to return to {level:.3f} fakeout zone ({fib_zone:.2f}) "
+            f"— current candle {'high' if bias==1 else 'low'}: {current_check:.2f}"
+        )
         return result
     result["step"] = 4
 
     # Step 5 — 5min BoS
-    bos = find_5min_bos(df_5m, bias, sweep["idx"])
+    bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
     result["bos"] = bos
     if bos is None:
         result["reason"] = f"In fakeout zone — waiting for 5min fractal BoS {'up' if bias == 1 else 'down'}"

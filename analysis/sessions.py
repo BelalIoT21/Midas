@@ -101,8 +101,11 @@ def get_current_session(dt: datetime | None = None) -> Session:
     return Session("Off-Hours", "💤", "low", False)
 
 
+def session_multiplier(session: Session) -> float:
+    """Confidence multiplier based on session quality."""
+    return {"best": 1.0, "good": 0.9, "low": 0.75}.get(session.quality, 1.0)
+
+
 def should_trade(session: Session, symbol: str = "XAU/USD") -> bool:
-    """London and NY overlap are the best sessions for Gold entries."""
-    if symbol == "BTC/USD":
-        return session.quality in ("best", "good")
-    return session.quality in ("best", "good")
+    """Only trade London and London/NY overlap — highest quality sessions only."""
+    return session.quality == "best"

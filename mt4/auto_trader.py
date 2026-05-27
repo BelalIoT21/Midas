@@ -415,7 +415,7 @@ def _gold_loop(
     from data.twelvedata import fetch_all_timeframes, fetch_candles
     from signals.engine import (
         detect_4h_bos, get_asia_extreme, find_sweep,
-        in_fakeout_zone, find_5min_bos, build_signal, fib_price,
+        scan_fakeout_zone, find_5min_bos, build_signal, fib_price,
     )
     from analysis.sessions import get_current_session
 
@@ -472,7 +472,7 @@ def _gold_loop(
             # ── Fetch candles ─────────────────────────────────────────────────
             try:
                 from config import TIMEFRAMES
-                candles  = fetch_all_timeframes(TIMEFRAMES, symbol="XAU/USD")
+                candles  = fetch_all_timeframes(TIMEFRAMES, symbol="XAU/USD", account=account)
             except Exception as e:
                 wait = 300 if "resets in" in str(e) else 30
                 stop_event.wait(wait)
@@ -543,13 +543,16 @@ def _gold_loop(
             # ── Step 4: Fakeout zone check ────────────────────────────────────
             current_price = float(df_5m["close"].iloc[-1])
             if not state.fakeout_reached:
-                if in_fakeout_zone(current_price, sweep["fib_high"], sweep["fib_low"], bias):
+                # Scan ALL bars since the sweep so a bounce that already happened
+                # is detected immediately (not just the current candle).
+                if scan_fakeout_zone(df_5m, sweep, bias):
                     _update_state(chat_id, "XAU/USD", fakeout_reached=True)
-                    fib_079 = fib_price(sweep["fib_high"], sweep["fib_low"], 0.079)
+                    from config import FAKEOUT_ZONE_LEVEL
+                    fib_zone = fib_price(sweep["fib_high"], sweep["fib_low"], FAKEOUT_ZONE_LEVEL)
                     notify_fn(
                         f"⚡ <b>In Fakeout Zone!</b>\n"
-                        f"Price <b>${current_price:,.2f}</b> reached 0.079 zone "
-                        f"(${fib_079:,.2f}+).\n"
+                        f"Price reached {FAKEOUT_ZONE_LEVEL:.3f} zone "
+                        f"(${fib_zone:,.2f}+).\n"
                         f"Watching for 5min fractal BoS {'up' if bias==1 else 'down'}."
                     )
                 stop_event.wait(60)
@@ -560,7 +563,7 @@ def _gold_loop(
                 if not is_gold_session(now):
                     stop_event.wait(60)
                     continue
-                bos = find_5min_bos(df_5m, bias, sweep["idx"])
+                bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
                 if bos is not None:
                     _update_state(chat_id, "XAU/USD", bos=bos)
                     notify_fn(
@@ -657,7 +660,7 @@ def _btc_loop(
     from data.twelvedata import fetch_all_timeframes
     from signals.engine import (
         detect_4h_bos, get_asia_extreme, find_sweep,
-        in_fakeout_zone, find_5min_bos, build_signal, fib_price,
+        scan_fakeout_zone, find_5min_bos, build_signal, fib_price,
     )
     from analysis.sessions import get_current_session
 
@@ -685,7 +688,7 @@ def _btc_loop(
             # Fetch candles
             try:
                 from config import TIMEFRAMES
-                candles = fetch_all_timeframes(TIMEFRAMES, symbol="BTC/USD")
+                candles = fetch_all_timeframes(TIMEFRAMES, symbol="BTC/USD", account=account)
             except Exception as e:
                 wait = 300 if "resets in" in str(e) else 30
                 stop_event.wait(wait)
@@ -742,16 +745,17 @@ def _btc_loop(
 
             sweep = state.sweep
 
-            # Step 4: Fakeout zone
+            # Step 4: Fakeout zone — scan all bars since the sweep so a bounce
+            # that already happened is caught immediately on mid-day /trade start.
             if not state.fakeout_reached:
-                if in_fakeout_zone(current_price, sweep["fib_high"], sweep["fib_low"], bias):
+                if scan_fakeout_zone(df_5m, sweep, bias):
                     _update_state(chat_id, "BTC/USD", fakeout_reached=True)
                 stop_event.wait(60)
                 continue
 
             # Step 5: 5min BoS
             if state.bos is None:
-                bos = find_5min_bos(df_5m, bias, sweep["idx"])
+                bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
                 if bos is not None:
                     _update_state(chat_id, "BTC/USD", bos=bos)
                 stop_event.wait(30)
@@ -829,7 +833,7 @@ def _eth_loop(
     from data.twelvedata import fetch_all_timeframes
     from signals.engine import (
         detect_4h_bos, get_asia_extreme, find_sweep,
-        in_fakeout_zone, find_5min_bos, build_signal,
+        scan_fakeout_zone, find_5min_bos, build_signal,
     )
     from analysis.sessions import get_current_session
 
@@ -861,7 +865,7 @@ def _eth_loop(
 
             try:
                 from config import TIMEFRAMES
-                candles = fetch_all_timeframes(TIMEFRAMES, symbol="ETH/USD")
+                candles = fetch_all_timeframes(TIMEFRAMES, symbol="ETH/USD", account=account)
             except Exception as e:
                 wait = 300 if "resets in" in str(e) else 30
                 stop_event.wait(wait)
@@ -901,11 +905,11 @@ def _eth_loop(
                 continue
 
             current_price = float(df_5m["close"].iloc[-1])
-            if not in_fakeout_zone(current_price, sweep["fib_high"], sweep["fib_low"], bias):
+            if not scan_fakeout_zone(df_5m, sweep, bias):
                 stop_event.wait(_BTC_SIGNAL_SECS)
                 continue
 
-            bos = find_5min_bos(df_5m, bias, sweep["idx"])
+            bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
             if bos is None:
                 stop_event.wait(_BTC_SIGNAL_SECS)
                 continue
@@ -965,7 +969,7 @@ def _gbpusd_loop(
     from data.twelvedata import fetch_all_timeframes
     from signals.engine import (
         detect_4h_bos, get_asia_extreme, find_sweep,
-        in_fakeout_zone, find_5min_bos, build_signal, fib_price,
+        scan_fakeout_zone, find_5min_bos, build_signal, fib_price,
     )
     from analysis.sessions import get_current_session
 
@@ -1006,7 +1010,7 @@ def _gbpusd_loop(
 
             try:
                 from config import TIMEFRAMES
-                candles = fetch_all_timeframes(TIMEFRAMES, symbol="GBP/USD")
+                candles = fetch_all_timeframes(TIMEFRAMES, symbol="GBP/USD", account=account)
             except Exception as e:
                 wait = 300 if "resets in" in str(e) else 30
                 stop_event.wait(wait)
@@ -1074,16 +1078,18 @@ def _gbpusd_loop(
 
             sweep = state.sweep
 
-            # Step 4: Fakeout zone
+            # Step 4: Fakeout zone — scan all bars since the sweep so a bounce
+            # that already happened is detected immediately on mid-day /trade start.
             current_price = float(df_5m["close"].iloc[-1])
             if not state.fakeout_reached:
-                if in_fakeout_zone(current_price, sweep["fib_high"], sweep["fib_low"], bias):
+                if scan_fakeout_zone(df_5m, sweep, bias):
                     _update_state(chat_id, "GBP/USD", fakeout_reached=True)
-                    fib_079 = fib_price(sweep["fib_high"], sweep["fib_low"], 0.079)
+                    from config import FAKEOUT_ZONE_LEVEL
+                    fib_zone = fib_price(sweep["fib_high"], sweep["fib_low"], FAKEOUT_ZONE_LEVEL)
                     notify_fn(
                         f"⚡ <b>GBP/USD In Fakeout Zone!</b>\n"
-                        f"Price <b>{current_price:.5f}</b> reached 0.079 zone "
-                        f"({fib_079:.5f}+).\n"
+                        f"Price reached {FAKEOUT_ZONE_LEVEL:.3f} zone "
+                        f"({fib_zone:.5f}+).\n"
                         f"Watching for 5min fractal BoS {'up' if bias==1 else 'down'}."
                     )
                 stop_event.wait(60)
@@ -1094,7 +1100,7 @@ def _gbpusd_loop(
                 if not is_gold_session(now):
                     stop_event.wait(60)
                     continue
-                bos = find_5min_bos(df_5m, bias, sweep["idx"])
+                bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
                 if bos is not None:
                     _update_state(chat_id, "GBP/USD", bos=bos)
                     notify_fn(
