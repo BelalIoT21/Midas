@@ -262,3 +262,172 @@ INDICATORS = [
 
 def compute_votes(df: pd.DataFrame) -> list[tuple[str, int]]:
     return [(name, fn(df)) for name, fn in INDICATORS]
+
+
+def precompute_votes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Vectorised compute_votes across the full DataFrame — runs each indicator
+    once on the whole series instead of per sliding window.  Returns a
+    DataFrame with one column per indicator (values in {-1, 0, 1}).
+    """
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
+    idx   = df.index
+    zero  = pd.Series(0, index=idx, dtype="int8")
+
+    def _s(series) -> pd.Series:
+        return series.reindex(idx) if series is not None else zero.copy()
+
+    votes: dict[str, pd.Series] = {}
+
+    # EMA Trend
+    e21  = ta.ema(close, length=21)
+    e50  = ta.ema(close, length=50)
+    e200 = ta.ema(close, length=200)
+    v = zero.copy()
+    v[(close > e21) & (e21 > e50) & e200.notna()] = 1
+    v[(close < e21) & (e21 < e50) & e200.notna()] = -1
+    votes["EMA Trend"] = v
+
+    # MACD
+    mr = ta.macd(close, fast=12, slow=26, signal=9)
+    if mr is not None and not mr.empty:
+        ml, hist, sig = mr.iloc[:, 0], mr.iloc[:, 1], mr.iloc[:, 2]
+        v = zero.copy()
+        v[(ml > sig) & (hist > 0)] = 1
+        v[(ml < sig) & (hist < 0)] = -1
+        votes["MACD"] = v
+    else:
+        votes["MACD"] = zero.copy()
+
+    # RSI
+    rsi = _s(ta.rsi(close, length=14))
+    v = zero.copy()
+    v[rsi > 50] = 1
+    v[rsi < 50] = -1
+    votes["RSI"] = v
+
+    # Stoch RSI
+    sr = ta.stochrsi(close, length=14, rsi_length=14, k=3, d=3)
+    if sr is not None and not sr.empty:
+        k = sr.iloc[:, 0]
+        v = zero.copy()
+        v[k > 50] = 1
+        v[k < 50] = -1
+        votes["Stoch RSI"] = v
+    else:
+        votes["Stoch RSI"] = zero.copy()
+
+    # BB Position
+    bb = ta.bbands(close, length=20, std=2)
+    if bb is not None and not bb.empty:
+        mid = bb.iloc[:, 1]
+        v = zero.copy()
+        v[close > mid] = 1
+        v[close < mid] = -1
+        votes["BB Position"] = v
+    else:
+        votes["BB Position"] = zero.copy()
+
+    # ADX
+    ar = ta.adx(high, low, close, length=14)
+    if ar is not None and not ar.empty:
+        adx_v, dmp, dmn = ar.iloc[:, 0], ar.iloc[:, 1], ar.iloc[:, 2]
+        v = zero.copy()
+        v[(adx_v >= 20) & (dmp > dmn)] = 1
+        v[(adx_v >= 20) & (dmn > dmp)] = -1
+        votes["ADX"] = v
+    else:
+        votes["ADX"] = zero.copy()
+
+    # CCI
+    cci = _s(ta.cci(high, low, close, length=20))
+    v = zero.copy()
+    v[cci > 0] = 1
+    v[cci < 0] = -1
+    votes["CCI"] = v
+
+    # Williams %R
+    wr = _s(ta.willr(high, low, close, length=14))
+    v = zero.copy()
+    v[wr < -50] = 1
+    v[wr > -50] = -1
+    votes["Williams %R"] = v
+
+    # Ichimoku
+    ir = ta.ichimoku(high, low, close)
+    if ir is not None and len(ir) >= 1 and ir[0] is not None and not ir[0].empty:
+        cols   = ir[0].columns.tolist()
+        sa_col = next((c for c in cols if "ISA" in c), None)
+        sb_col = next((c for c in cols if "ISB" in c), None)
+        if sa_col and sb_col:
+            sa, sb    = ir[0][sa_col], ir[0][sb_col]
+            cloud_top = pd.concat([sa, sb], axis=1).max(axis=1).reindex(idx)
+            cloud_bot = pd.concat([sa, sb], axis=1).min(axis=1).reindex(idx)
+            v = zero.copy()
+            v[close > cloud_top] = 1
+            v[close < cloud_bot] = -1
+            votes["Ichimoku"] = v
+        else:
+            votes["Ichimoku"] = zero.copy()
+    else:
+        votes["Ichimoku"] = zero.copy()
+
+    # Supertrend
+    str_r = ta.supertrend(high, low, close, length=7, multiplier=3.0)
+    if str_r is not None and not str_r.empty:
+        dc = next((c for c in str_r.columns if "SUPERTd" in c), None)
+        if dc:
+            d = str_r[dc]
+            v = zero.copy()
+            v[d == 1]  = 1
+            v[d == -1] = -1
+            votes["Supertrend"] = v
+        else:
+            votes["Supertrend"] = zero.copy()
+    else:
+        votes["Supertrend"] = zero.copy()
+
+    # Momentum
+    mom = _s(ta.mom(close, length=10))
+    v = zero.copy()
+    v[mom > 0] = 1
+    v[mom < 0] = -1
+    votes["Momentum"] = v
+
+    return pd.DataFrame(votes, index=idx).fillna(0).astype("int8")
+
+
+def precompute_indicators(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """
+    Returns helper Series for backtest filter checks:
+      atr, rsi14, adx, adx_dmp, adx_dmn, supertrend_dir
+    """
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
+
+    atr_s = ta.atr(high, low, close, length=14)
+    rsi_s = ta.rsi(close, length=14)
+
+    ar = ta.adx(high, low, close, length=14)
+    adx_s = ar.iloc[:, 0] if ar is not None and not ar.empty else pd.Series(dtype=float)
+    dmp_s = ar.iloc[:, 1] if ar is not None and not ar.empty else pd.Series(dtype=float)
+    dmn_s = ar.iloc[:, 2] if ar is not None and not ar.empty else pd.Series(dtype=float)
+
+    str_r = ta.supertrend(high, low, close, length=7, multiplier=3.0)
+    if str_r is not None and not str_r.empty:
+        dc    = next((c for c in str_r.columns if "SUPERTd" in c), None)
+        st_s  = str_r[dc] if dc else pd.Series(dtype=float)
+    else:
+        st_s = pd.Series(dtype=float)
+
+    return {
+        "atr":           atr_s,
+        "rsi14":         rsi_s,
+        "adx":           adx_s,
+        "adx_dmp":       dmp_s,
+        "adx_dmn":       dmn_s,
+        "supertrend_dir": st_s,
+    }

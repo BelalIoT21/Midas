@@ -35,6 +35,7 @@ from config import (
     NEWS_BLACKOUT_WINDOWS, ENTRY_FIB_LEVEL, RISK_PCT,
     GBPUSD_ENABLED, GBPUSD_PAPER_TRADE, OANDA_GBPUSD_SYMBOL,
     GBPUSD_PIP_VALUE, GBPUSD_LOT_CAPS,
+    EURUSD_ENABLED, EURUSD_PAPER_TRADE, OANDA_EURUSD_SYMBOL,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,15 @@ def _calculate_lot_gbpusd(balance: float, sl_distance: float) -> float:
     """Lot = (balance × 2%) ÷ (sl_pips × GBPUSD_PIP_VALUE)
     sl_distance is in price units (e.g. 0.0015 for 15 pips).
     """
+    if sl_distance <= 0:
+        return 0.01
+    sl_pips = sl_distance / 0.0001
+    lot = (balance * RISK_PCT) / (sl_pips * GBPUSD_PIP_VALUE)
+    return _apply_lot_cap(lot, balance, GBPUSD_LOT_CAPS)
+
+
+def _calculate_lot_eurusd(balance: float, sl_distance: float) -> float:
+    """Same formula as GBP/USD — EUR/USD pip value is similar."""
     if sl_distance <= 0:
         return 0.01
     sl_pips = sl_distance / 0.0001
@@ -290,15 +300,21 @@ _active_gold:   dict[str, _OpenTrade] = {}
 _active_btc:    dict[str, _OpenTrade] = {}
 _active_eth:    dict[str, _OpenTrade] = {}
 _active_gbpusd: dict[str, _OpenTrade] = {}
+_active_eurusd: dict[str, _OpenTrade] = {}
+_active_us30:   dict[str, _OpenTrade] = {}
 _lock_gold    = threading.Lock()
 _lock_btc     = threading.Lock()
 _lock_eth     = threading.Lock()
 _lock_gbpusd  = threading.Lock()
+_lock_eurusd  = threading.Lock()
+_lock_us30    = threading.Lock()
 
 _auto_stop_gold:   dict[str, threading.Event] = {}
 _auto_stop_btc:    dict[str, threading.Event] = {}
 _auto_stop_eth:    dict[str, threading.Event] = {}
 _auto_stop_gbpusd: dict[str, threading.Event] = {}
+_auto_stop_eurusd: dict[str, threading.Event] = {}
+_auto_stop_us30:   dict[str, threading.Event] = {}
 _auto_lock = threading.Lock()
 
 
@@ -308,30 +324,29 @@ def is_active(chat_id: str) -> bool:
     return (
         chat_id in _active_gold or chat_id in _active_btc
         or chat_id in _active_eth or chat_id in _active_gbpusd
+        or chat_id in _active_eurusd or chat_id in _active_us30
     )
 
 
 def is_auto_active(chat_id: str) -> bool:
-    gold_evt   = _auto_stop_gold.get(chat_id)
-    btc_evt    = _auto_stop_btc.get(chat_id)
-    eth_evt    = _auto_stop_eth.get(chat_id)
-    gbpusd_evt = _auto_stop_gbpusd.get(chat_id)
-    return (
-        (gold_evt   is not None and not gold_evt.is_set())   or
-        (btc_evt    is not None and not btc_evt.is_set())    or
-        (eth_evt    is not None and not eth_evt.is_set())    or
-        (gbpusd_evt is not None and not gbpusd_evt.is_set())
-    )
+    for stop_dict in (_auto_stop_gold, _auto_stop_btc, _auto_stop_eth,
+                      _auto_stop_gbpusd, _auto_stop_eurusd, _auto_stop_us30):
+        evt = stop_dict.get(chat_id)
+        if evt is not None and not evt.is_set():
+            return True
+    return False
 
 
 def stop_auto_trader(chat_id: str) -> bool:
     stopped = False
-    for stop_dict in (_auto_stop_gold, _auto_stop_btc, _auto_stop_eth, _auto_stop_gbpusd):
+    for stop_dict in (_auto_stop_gold, _auto_stop_btc, _auto_stop_eth,
+                      _auto_stop_gbpusd, _auto_stop_eurusd, _auto_stop_us30):
         evt = stop_dict.get(chat_id)
         if evt and not evt.is_set():
             evt.set()
             stopped = True
-    for trade_dict in (_active_gold, _active_btc, _active_eth, _active_gbpusd):
+    for trade_dict in (_active_gold, _active_btc, _active_eth,
+                       _active_gbpusd, _active_eurusd, _active_us30):
         trade = trade_dict.get(chat_id)
         if trade:
             trade.stop_event.set()
@@ -339,7 +354,7 @@ def stop_auto_trader(chat_id: str) -> bool:
 
 
 def start_auto_trader(chat_id: str, account: dict, notify_fn) -> bool:
-    from config import ETH_ENABLED
+    from config import ETH_ENABLED, US30_ENABLED, US30_PAPER_TRADE
     _init_table()
     with _auto_lock:
         gold_running = (
@@ -352,26 +367,27 @@ def start_auto_trader(chat_id: str, account: dict, notify_fn) -> bool:
         stop_btc    = threading.Event()
         stop_eth    = threading.Event()
         stop_gbpusd = threading.Event()
+        stop_eurusd = threading.Event()
+        stop_us30   = threading.Event()
         _auto_stop_gold[chat_id]   = stop_gold
         _auto_stop_btc[chat_id]    = stop_btc
         _auto_stop_eth[chat_id]    = stop_eth
         _auto_stop_gbpusd[chat_id] = stop_gbpusd
+        _auto_stop_eurusd[chat_id] = stop_eurusd
+        _auto_stop_us30[chat_id]   = stop_us30
 
     threading.Thread(
         target=_gold_loop,
         args=(chat_id, account, notify_fn, stop_gold),
-        daemon=True,
-        name=f"gold-{chat_id}",
+        daemon=True, name=f"gold-{chat_id}",
     ).start()
-
     symbols_started = ["Gold"]
 
     if BTC_ENABLED:
         threading.Thread(
             target=_btc_loop,
             args=(chat_id, account, notify_fn, stop_btc),
-            daemon=True,
-            name=f"btc-{chat_id}",
+            daemon=True, name=f"btc-{chat_id}",
         ).start()
         symbols_started.append("BTC")
     else:
@@ -381,8 +397,7 @@ def start_auto_trader(chat_id: str, account: dict, notify_fn) -> bool:
         threading.Thread(
             target=_eth_loop,
             args=(chat_id, account, notify_fn, stop_eth),
-            daemon=True,
-            name=f"eth-{chat_id}",
+            daemon=True, name=f"eth-{chat_id}",
         ).start()
         symbols_started.append("ETH")
     else:
@@ -392,15 +407,136 @@ def start_auto_trader(chat_id: str, account: dict, notify_fn) -> bool:
         threading.Thread(
             target=_gbpusd_loop,
             args=(chat_id, account, notify_fn, stop_gbpusd),
-            daemon=True,
-            name=f"gbpusd-{chat_id}",
+            daemon=True, name=f"gbpusd-{chat_id}",
         ).start()
         symbols_started.append("GBP/USD")
     else:
         stop_gbpusd.set()
 
+    if EURUSD_ENABLED:
+        threading.Thread(
+            target=_eurusd_loop,
+            args=(chat_id, account, notify_fn, stop_eurusd),
+            daemon=True, name=f"eurusd-{chat_id}",
+        ).start()
+        symbols_started.append("EUR/USD")
+    else:
+        stop_eurusd.set()
+
+    if US30_ENABLED:
+        threading.Thread(
+            target=_us30_loop,
+            args=(chat_id, account, notify_fn, stop_us30),
+            daemon=True, name=f"us30-{chat_id}",
+        ).start()
+        symbols_started.append("US30")
+    else:
+        stop_us30.set()
+
     logger.info(f"[auto_trader] loops started for {chat_id}: {', '.join(symbols_started)}")
     return True
+
+
+# ── Day bootstrap: scan 24h of history to find current step ──────────────────
+
+def _bootstrap_state(
+    chat_id:   str,
+    symbol:    str,
+    df_4h:     "pd.DataFrame",
+    df_5m:     "pd.DataFrame",
+    notify_fn,
+) -> int:
+    """
+    Walk 24h of candle history right now to discover which of the 6 steps has
+    already completed today.  Sets the state machine fields so the main polling
+    loop starts from the correct step instead of waiting step-by-step.
+
+    Returns the highest step reached (0–5; step 6 = entry, handled in main loop).
+    """
+    from signals.engine import (
+        detect_4h_bos, get_asia_extreme, find_sweep,
+        scan_fakeout_zone, find_5min_bos, fib_price,
+    )
+    from datetime import datetime, timezone
+    from config import FAKEOUT_ZONE_LEVEL
+
+    today = datetime.now(timezone.utc).date()
+    state = _get_state(chat_id, symbol, today)
+
+    # Price formatter: forex uses 5dp, everything else uses $x,xxx.xx
+    _is_forex = symbol in ("GBP/USD", "EUR/USD")
+    def _fp(v: float) -> str:
+        return f"{v:.5f}" if _is_forex else f"${v:,.2f}"
+
+    # Already bootstrapped for today — skip
+    if state.bias != 0:
+        return 5 if state.bos else (4 if state.fakeout_reached else (3 if state.sweep else (2 if state.asia_extreme else 1)))
+
+    step_reached = 0
+
+    # Step 1 — 4H bias
+    bias = detect_4h_bos(df_4h)
+    if bias == 0:
+        return 0
+    _update_state(chat_id, symbol, bias=bias)
+    step_reached = 1
+
+    # Step 2 — Asia extreme
+    asia = get_asia_extreme(df_5m, bias, today)
+    if asia is None:
+        _label = "BULLISH 📈" if bias == 1 else "BEARISH 📉"
+        notify_fn(
+            f"📊 <b>{symbol} Bias: {_label}</b>\n"
+            f"Waiting for Asia session (00:00–08:00 UTC)."
+        )
+        return step_reached
+    _update_state(chat_id, symbol, asia_extreme=asia)
+    step_reached = 2
+
+    # Step 3 — Sweep
+    sweep = find_sweep(df_5m, asia, bias, trade_date=today)
+    if sweep is None:
+        level_type = "low" if bias == 1 else "high"
+        _label = "BULLISH 📈" if bias == 1 else "BEARISH 📉"
+        notify_fn(
+            f"📊 <b>{symbol} Bias: {_label}</b>\n"
+            f"Asia {'Low' if bias==1 else 'High'}: <b>{_fp(asia)}</b>\n"
+            f"Waiting for Asia {level_type} sweep in London/NY."
+        )
+        return step_reached
+    _update_state(chat_id, symbol, sweep=sweep)
+    step_reached = 3
+
+    # Step 4 — Fakeout zone
+    if not scan_fakeout_zone(df_5m, sweep, bias):
+        fib_zone = fib_price(sweep["fib_high"], sweep["fib_low"], FAKEOUT_ZONE_LEVEL)
+        notify_fn(
+            f"🎯 <b>{symbol} Sweep found</b> @ {_fp(sweep['sweep_price'])}\n"
+            f"Waiting for price to return to {FAKEOUT_ZONE_LEVEL:.3f} fakeout zone ({_fp(fib_zone)})."
+        )
+        return step_reached
+    _update_state(chat_id, symbol, fakeout_reached=True)
+    step_reached = 4
+
+    # Step 5 — 5min BoS
+    bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
+    if bos is None:
+        notify_fn(
+            f"⚡ <b>{symbol} In fakeout zone</b>\n"
+            f"Waiting for 5min fractal BoS {'up' if bias==1 else 'down'}."
+        )
+        return step_reached
+    _update_state(chat_id, symbol, bos=bos)
+    step_reached = 5
+
+    notify_fn(
+        f"⚡ <b>{symbol} — Caught up to Step 5!</b>\n"
+        f"Bias: {'BULLISH 📈' if bias==1 else 'BEARISH 📉'}  "
+        f"Asia: {_fp(asia)}  Sweep: {_fp(sweep['sweep_price'])}\n"
+        f"BoS: {_fp(bos['swing_low'])}–{_fp(bos['swing_high'])}\n"
+        f"Watching for entry zone now."
+    )
+    return step_reached
 
 
 # ── Gold loop ─────────────────────────────────────────────────────────────────
@@ -484,40 +620,36 @@ def _gold_loop(
                 stop_event.wait(60)
                 continue
 
-            # ── Step 1: 4H Bias ───────────────────────────────────────────────
-            if state.bias == 0:
-                bias = detect_4h_bos(df_4h)
-                if bias == 0:
+            # ── Bootstrap: scan 24h of history to jump to current step ────────
+            # Runs once per day (when state.bias == 0). Reads back all candle data
+            # and sets state to whatever step the market is already at, so we never
+            # wait for steps that already happened hours ago.
+            if state.bias == 0 and now.hour >= 8:
+                _bootstrap_state(chat_id, "XAU/USD", df_4h, df_5m, notify_fn)
+                state = _get_state(chat_id, "XAU/USD", today)
+                if state.bias == 0:
                     stop_event.wait(_GOLD_SIGNAL_SECS)
                     continue
-                _update_state(chat_id, "XAU/USD", bias=bias)
-                notify_fn(
-                    f"📊 <b>Gold Bias Set — {'BULLISH 📈' if bias == 1 else 'BEARISH 📉'}</b>\n"
-                    f"4H fractal BoS confirmed. Watching for Asia sweep."
-                )
-                logger.info(f"[gold] {chat_id} bias={'BUY' if bias==1 else 'SELL'}")
-                stop_event.wait(60)
-                continue
 
             bias = state.bias
 
-            # ── Step 2: Asia extreme (only mark after Asia session ends 08:00 UTC) ─
-            if state.asia_extreme is None and now.hour >= 8:
-                asia = get_asia_extreme(df_5m, bias, today)
-                if asia is not None:
-                    _update_state(chat_id, "XAU/USD", asia_extreme=asia)
-                    level_label = "Low" if bias == 1 else "High"
-                    notify_fn(
-                        f"📍 <b>Asia Level Marked</b>\n"
-                        f"Asia {level_label}: <b>${asia:,.2f}</b>\n"
-                        f"Watching for {'below' if bias==1 else 'above'} sweep in London/NY."
-                    )
-                stop_event.wait(60)
-                continue
-
+            # ── Step 2: Asia extreme ──────────────────────────────────────────
             if state.asia_extreme is None:
-                stop_event.wait(60)
-                continue
+                if now.hour < 8:
+                    stop_event.wait(60)
+                    continue
+                asia = get_asia_extreme(df_5m, bias, today)
+                if asia is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "XAU/USD", asia_extreme=asia)
+                level_label = "Low" if bias == 1 else "High"
+                notify_fn(
+                    f"📍 <b>Asia Level Marked</b>\n"
+                    f"Asia {level_label}: <b>${asia:,.2f}</b>\n"
+                    f"Watching for {'below' if bias==1 else 'above'} sweep in London/NY."
+                )
+                # Fall through immediately to next step
 
             # ── Step 3: Sweep detection ───────────────────────────────────────
             if state.sweep is None:
@@ -525,38 +657,38 @@ def _gold_loop(
                     stop_event.wait(60)
                     continue
                 sweep = find_sweep(df_5m, state.asia_extreme, bias, trade_date=today)
-                if sweep is not None:
-                    _update_state(chat_id, "XAU/USD", sweep=sweep)
-                    notify_fn(
-                        f"🎯 <b>Asia Level Swept!</b>\n"
-                        f"Sweep @ <b>${sweep['sweep_price']:,.2f}</b> "
-                        f"(Asia level: ${state.asia_extreme:,.2f})\n"
-                        f"Fib range: ${sweep['fib_low']:,.2f} – ${sweep['fib_high']:,.2f}\n"
-                        f"Watching for bounce to 0.079 fakeout zone "
-                        f"(${fib_price(sweep['fib_high'], sweep['fib_low'], 0.079):,.2f}+)."
-                    )
-                stop_event.wait(60)
-                continue
+                if sweep is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "XAU/USD", sweep=sweep)
+                notify_fn(
+                    f"🎯 <b>Asia Level Swept!</b>\n"
+                    f"Sweep @ <b>${sweep['sweep_price']:,.2f}</b> "
+                    f"(Asia level: ${state.asia_extreme:,.2f})\n"
+                    f"Fib range: ${sweep['fib_low']:,.2f} – ${sweep['fib_high']:,.2f}\n"
+                    f"Watching for bounce to 0.079 fakeout zone "
+                    f"(${fib_price(sweep['fib_high'], sweep['fib_low'], 0.079):,.2f}+)."
+                )
+                # Fall through immediately to next step
 
             sweep = state.sweep
 
             # ── Step 4: Fakeout zone check ────────────────────────────────────
             current_price = float(df_5m["close"].iloc[-1])
             if not state.fakeout_reached:
-                # Scan ALL bars since the sweep so a bounce that already happened
-                # is detected immediately (not just the current candle).
-                if scan_fakeout_zone(df_5m, sweep, bias):
-                    _update_state(chat_id, "XAU/USD", fakeout_reached=True)
-                    from config import FAKEOUT_ZONE_LEVEL
-                    fib_zone = fib_price(sweep["fib_high"], sweep["fib_low"], FAKEOUT_ZONE_LEVEL)
-                    notify_fn(
-                        f"⚡ <b>In Fakeout Zone!</b>\n"
-                        f"Price reached {FAKEOUT_ZONE_LEVEL:.3f} zone "
-                        f"(${fib_zone:,.2f}+).\n"
-                        f"Watching for 5min fractal BoS {'up' if bias==1 else 'down'}."
-                    )
-                stop_event.wait(60)
-                continue
+                if not scan_fakeout_zone(df_5m, sweep, bias):
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "XAU/USD", fakeout_reached=True)
+                from config import FAKEOUT_ZONE_LEVEL
+                fib_zone = fib_price(sweep["fib_high"], sweep["fib_low"], FAKEOUT_ZONE_LEVEL)
+                notify_fn(
+                    f"⚡ <b>In Fakeout Zone!</b>\n"
+                    f"Price reached {FAKEOUT_ZONE_LEVEL:.3f} zone "
+                    f"(${fib_zone:,.2f}+).\n"
+                    f"Watching for 5min fractal BoS {'up' if bias==1 else 'down'}."
+                )
+                # Fall through immediately to next step
 
             # ── Step 5: 5min BoS confirmation ─────────────────────────────────
             if state.bos is None:
@@ -564,16 +696,17 @@ def _gold_loop(
                     stop_event.wait(60)
                     continue
                 bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
-                if bos is not None:
-                    _update_state(chat_id, "XAU/USD", bos=bos)
-                    notify_fn(
-                        f"✅ <b>5min BoS Confirmed!</b>\n"
-                        f"Swing: ${bos['swing_low']:,.2f} – ${bos['swing_high']:,.2f}\n"
-                        f"Watching for price to enter Goldilocks zone "
-                        f"(0.5–0.618 fib)."
-                    )
-                stop_event.wait(30)
-                continue
+                if bos is None:
+                    stop_event.wait(30)
+                    continue
+                _update_state(chat_id, "XAU/USD", bos=bos)
+                notify_fn(
+                    f"✅ <b>5min BoS Confirmed!</b>\n"
+                    f"Swing: ${bos['swing_low']:,.2f} – ${bos['swing_high']:,.2f}\n"
+                    f"Watching for price to enter Goldilocks zone "
+                    f"(0.5–0.618 fib)."
+                )
+                # Fall through immediately to step 6
 
             bos = state.bos
 
@@ -702,64 +835,59 @@ def _btc_loop(
 
             current_price = float(df_5m["close"].iloc[-1])
 
-            # Step 1: Bias
-            if state.bias == 0:
-                bias = detect_4h_bos(df_4h)
-                if bias == 0:
+            # Bootstrap: scan 24h history to jump to current step (runs once per day)
+            if state.bias == 0 and now.hour >= 8:
+                _bootstrap_state(chat_id, "BTC/USD", df_4h, df_5m, notify_fn)
+                state = _get_state(chat_id, "BTC/USD", today)
+                if state.bias == 0:
                     stop_event.wait(_BTC_SIGNAL_SECS)
                     continue
-                _update_state(chat_id, "BTC/USD", bias=bias)
-                notify_fn(
-                    f"₿ <b>BTC Bias — {'BULLISH 📈' if bias==1 else 'BEARISH 📉'}</b>\n"
-                    f"4H fractal BoS confirmed. Watching for sweep."
-                )
-                stop_event.wait(60)
-                continue
 
             bias = state.bias
 
-            # Step 2: Asia extreme
-            if state.asia_extreme is None and now.hour >= 8:
-                asia = get_asia_extreme(df_5m, bias, today)
-                if asia is not None:
-                    _update_state(chat_id, "BTC/USD", asia_extreme=asia)
-                stop_event.wait(60)
-                continue
-
+            # Step 2: Asia extreme (live detection — picks up if bootstrap didn't find it)
             if state.asia_extreme is None:
-                stop_event.wait(60)
-                continue
+                if now.hour < 8:
+                    stop_event.wait(60)
+                    continue
+                asia = get_asia_extreme(df_5m, bias, today)
+                if asia is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "BTC/USD", asia_extreme=asia)
 
             # Step 3: Sweep
             if state.sweep is None:
                 sweep = find_sweep(df_5m, state.asia_extreme, bias, trade_date=today)
-                if sweep is not None:
-                    _update_state(chat_id, "BTC/USD", sweep=sweep)
-                    notify_fn(
-                        f"₿ <b>BTC Sweep Detected!</b>\n"
-                        f"@ ${sweep['sweep_price']:,.2f} "
-                        f"(Asia level: ${state.asia_extreme:,.2f})"
-                    )
-                stop_event.wait(60)
-                continue
+                if sweep is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "BTC/USD", sweep=sweep)
+                notify_fn(
+                    f"₿ <b>BTC Sweep Detected!</b>\n"
+                    f"@ ${sweep['sweep_price']:,.2f} "
+                    f"(Asia level: ${state.asia_extreme:,.2f})"
+                )
+                # Fall through immediately to step 4
 
             sweep = state.sweep
 
-            # Step 4: Fakeout zone — scan all bars since the sweep so a bounce
-            # that already happened is caught immediately on mid-day /trade start.
+            # Step 4: Fakeout zone
             if not state.fakeout_reached:
-                if scan_fakeout_zone(df_5m, sweep, bias):
-                    _update_state(chat_id, "BTC/USD", fakeout_reached=True)
-                stop_event.wait(60)
-                continue
+                if not scan_fakeout_zone(df_5m, sweep, bias):
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "BTC/USD", fakeout_reached=True)
+                # Fall through immediately to step 5
 
             # Step 5: 5min BoS
             if state.bos is None:
                 bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
-                if bos is not None:
-                    _update_state(chat_id, "BTC/USD", bos=bos)
-                stop_event.wait(30)
-                continue
+                if bos is None:
+                    stop_event.wait(30)
+                    continue
+                _update_state(chat_id, "BTC/USD", bos=bos)
+                # Fall through immediately to step 6
 
             bos = state.bos
 
@@ -829,11 +957,11 @@ def _eth_loop(
     notify_fn,
     stop_event: threading.Event,
 ) -> None:
-    from config import ETH_PAPER_TRADE, OANDA_ETH_SYMBOL, ETH_LOT_CAPS
+    from config import ETH_PAPER_TRADE, OANDA_ETH_SYMBOL, ETH_LOT_CAPS, TIMEFRAMES
     from data.twelvedata import fetch_all_timeframes
     from signals.engine import (
         detect_4h_bos, get_asia_extreme, find_sweep,
-        scan_fakeout_zone, find_5min_bos, build_signal,
+        scan_fakeout_zone, find_5min_bos, build_signal, fib_price,
     )
     from analysis.sessions import get_current_session
 
@@ -864,17 +992,68 @@ def _eth_loop(
                 continue
 
             try:
-                from config import TIMEFRAMES
                 candles = fetch_all_timeframes(TIMEFRAMES, symbol="ETH/USD", account=account)
             except Exception as e:
-                wait = 300 if "resets in" in str(e) else 30
-                stop_event.wait(wait)
+                stop_event.wait(300 if "resets in" in str(e) else 30)
                 continue
 
             df_4h = candles.get("4h")
             df_5m = candles.get("5min")
             if df_4h is None or df_5m is None:
                 stop_event.wait(60)
+                continue
+
+            # Bootstrap: scan 24h history to jump to current step (runs once per day)
+            if state.bias == 0 and now.hour >= 8:
+                _bootstrap_state(chat_id, "ETH/USD", df_4h, df_5m, notify_fn)
+                state = _get_state(chat_id, "ETH/USD", today)
+                if state.bias == 0:
+                    stop_event.wait(_BTC_SIGNAL_SECS)
+                    continue
+
+            bias = state.bias
+
+            if state.asia_extreme is None:
+                if now.hour < 8:
+                    stop_event.wait(60)
+                    continue
+                asia = get_asia_extreme(df_5m, bias, today)
+                if asia is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "ETH/USD", asia_extreme=asia)
+
+            if state.sweep is None:
+                sweep = find_sweep(df_5m, state.asia_extreme, bias, trade_date=today)
+                if sweep is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "ETH/USD", sweep=sweep)
+
+            sweep = state.sweep
+            current_price = float(df_5m["close"].iloc[-1])
+
+            if not state.fakeout_reached:
+                if not scan_fakeout_zone(df_5m, sweep, bias):
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "ETH/USD", fakeout_reached=True)
+
+            if state.bos is None:
+                bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
+                if bos is None:
+                    stop_event.wait(30)
+                    continue
+                _update_state(chat_id, "ETH/USD", bos=bos)
+
+            bos = state.bos
+            session = get_current_session(now)
+            signal = build_signal(
+                current_price, bos, bias, session, "ETH/USD",
+                state.asia_extreme, sweep["fib_high"], sweep["fib_low"],
+            )
+            if signal is None:
+                stop_event.wait(_BTC_SIGNAL_SECS)
                 continue
 
             balance = fetch_balance(
@@ -887,41 +1066,6 @@ def _eth_loop(
 
             if state.opening_balance is None:
                 _update_state(chat_id, "ETH/USD", opening_balance=balance)
-
-            # Run full 6-step logic regardless of paper/live mode
-            bias = detect_4h_bos(df_4h)
-            if bias == 0:
-                stop_event.wait(_BTC_SIGNAL_SECS)
-                continue
-
-            asia = get_asia_extreme(df_5m, bias, today)
-            if asia is None:
-                stop_event.wait(_BTC_SIGNAL_SECS)
-                continue
-
-            sweep = find_sweep(df_5m, asia, bias, trade_date=today)
-            if sweep is None:
-                stop_event.wait(_BTC_SIGNAL_SECS)
-                continue
-
-            current_price = float(df_5m["close"].iloc[-1])
-            if not scan_fakeout_zone(df_5m, sweep, bias):
-                stop_event.wait(_BTC_SIGNAL_SECS)
-                continue
-
-            bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
-            if bos is None:
-                stop_event.wait(_BTC_SIGNAL_SECS)
-                continue
-
-            session = get_current_session(now)
-            signal = build_signal(
-                current_price, bos, bias, session, "ETH/USD",
-                asia, sweep["fib_high"], sweep["fib_low"],
-            )
-            if signal is None:
-                stop_event.wait(_BTC_SIGNAL_SECS)
-                continue
 
             if ETH_PAPER_TRADE:
                 _execute_paper_btc(
@@ -953,6 +1097,159 @@ def _eth_loop(
             stop_event.wait(30)
 
     logger.info(f"[eth] loop stopped for {chat_id}")
+    with _auto_lock:
+        _auto_stop_eth.pop(chat_id, None)
+
+
+# ── US30 loop ─────────────────────────────────────────────────────────────────
+
+def _us30_loop(
+    chat_id:    str,
+    account:    dict,
+    notify_fn,
+    stop_event: threading.Event,
+) -> None:
+    from config import US30_PAPER_TRADE, OANDA_US30_SYMBOL, US30_LOT_CAPS, TIMEFRAMES, RISK_PCT
+    from data.twelvedata import fetch_all_timeframes
+    from signals.engine import (
+        detect_4h_bos, get_asia_extreme, find_sweep,
+        scan_fakeout_zone, find_5min_bos, build_signal, fib_price,
+    )
+    from analysis.sessions import get_current_session
+
+    def _calc_lot_us30(bal: float, sl_dist: float) -> float:
+        if sl_dist <= 0:
+            return 0.01
+        lot = (bal * RISK_PCT) / sl_dist
+        for min_b, max_b, max_l in US30_LOT_CAPS:
+            if min_b <= bal < max_b:
+                return min(max(0.01, round(lot, 2)), max_l)
+        return max(0.01, round(lot, 2))
+
+    logger.info(f"[us30] loop started for {chat_id}")
+
+    while not stop_event.is_set():
+        try:
+            now   = datetime.now(timezone.utc)
+            today = now.date()
+            state = _get_state(chat_id, "US30", today)
+
+            if chat_id in _active_us30:
+                stop_event.wait(_POLL_SECS)
+                continue
+
+            if state.trades_today >= MAX_TRADES_PER_DAY:
+                stop_event.wait(300)
+                continue
+
+            try:
+                candles = fetch_all_timeframes(TIMEFRAMES, symbol="US30", account=account)
+            except Exception as e:
+                stop_event.wait(300 if "resets in" in str(e) else 30)
+                continue
+
+            df_4h = candles.get("4h")
+            df_5m = candles.get("5min")
+            if df_4h is None or df_5m is None:
+                stop_event.wait(60)
+                continue
+
+            # Bootstrap: scan 24h history to jump to current step (runs once per day)
+            if state.bias == 0 and now.hour >= 8:
+                _bootstrap_state(chat_id, "US30", df_4h, df_5m, notify_fn)
+                state = _get_state(chat_id, "US30", today)
+                if state.bias == 0:
+                    stop_event.wait(_BTC_SIGNAL_SECS)
+                    continue
+
+            bias = state.bias
+
+            if state.asia_extreme is None:
+                if now.hour < 8:
+                    stop_event.wait(60)
+                    continue
+                asia = get_asia_extreme(df_5m, bias, today)
+                if asia is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "US30", asia_extreme=asia)
+
+            if state.sweep is None:
+                sweep = find_sweep(df_5m, state.asia_extreme, bias, trade_date=today)
+                if sweep is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "US30", sweep=sweep)
+
+            sweep = state.sweep
+            current_price = float(df_5m["close"].iloc[-1])
+
+            if not state.fakeout_reached:
+                if not scan_fakeout_zone(df_5m, sweep, bias):
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "US30", fakeout_reached=True)
+
+            if state.bos is None:
+                bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
+                if bos is None:
+                    stop_event.wait(30)
+                    continue
+                _update_state(chat_id, "US30", bos=bos)
+
+            bos = state.bos
+            session = get_current_session(now)
+            signal = build_signal(
+                current_price, bos, bias, session, "US30",
+                state.asia_extreme, sweep["fib_high"], sweep["fib_low"],
+            )
+            if signal is None:
+                stop_event.wait(_BTC_SIGNAL_SECS)
+                continue
+
+            balance = fetch_balance(
+                account["metaapi_account_id"], account["password"],
+                account.get("server", "practice"),
+            )
+            if balance is None:
+                stop_event.wait(30)
+                continue
+
+            if state.opening_balance is None:
+                _update_state(chat_id, "US30", opening_balance=balance)
+
+            if US30_PAPER_TRADE:
+                _execute_paper_btc(
+                    chat_id=chat_id, notify_fn=notify_fn,
+                    stop_event=stop_event, signal=signal, state=state,
+                )
+            else:
+                lot = _calc_lot_us30(balance, signal.sl_pips)
+                _execute_trade(
+                    symbol      = "US30",
+                    oanda_instr = OANDA_US30_SYMBOL,
+                    chat_id     = chat_id,
+                    account     = account,
+                    notify_fn   = notify_fn,
+                    stop_event  = stop_event,
+                    signal      = signal,
+                    active_dict = _active_us30,
+                    active_lock = _lock_us30,
+                    lot         = lot,
+                    state       = state,
+                    balance     = balance,
+                    is_btc      = True,
+                )
+
+            _update_state(chat_id, "US30", sweep=None, fakeout_reached=False, bos=None)
+
+        except Exception as e:
+            logger.exception(f"[us30] loop error for {chat_id}: {e}")
+            stop_event.wait(30)
+
+    logger.info(f"[us30] loop stopped for {chat_id}")
+    with _auto_lock:
+        _auto_stop_us30.pop(chat_id, None)
     with _auto_lock:
         _auto_stop_eth.pop(chat_id, None)
 
@@ -1022,40 +1319,33 @@ def _gbpusd_loop(
                 stop_event.wait(60)
                 continue
 
-            # Step 1: 4H Bias
-            if state.bias == 0:
-                bias = detect_4h_bos(df_4h)
-                if bias == 0:
+            # Bootstrap: scan 24h history to jump to current step (runs once per day)
+            if state.bias == 0 and now.hour >= 8:
+                _bootstrap_state(chat_id, "GBP/USD", df_4h, df_5m, notify_fn)
+                state = _get_state(chat_id, "GBP/USD", today)
+                if state.bias == 0:
                     stop_event.wait(_GOLD_SIGNAL_SECS)
                     continue
-                _update_state(chat_id, "GBP/USD", bias=bias)
-                notify_fn(
-                    f"💷 <b>GBP/USD Bias — {'BULLISH 📈' if bias==1 else 'BEARISH 📉'}</b>\n"
-                    f"4H fractal BoS confirmed. Watching for Asia sweep."
-                )
-                logger.info(f"[gbpusd] {chat_id} bias={'BUY' if bias==1 else 'SELL'}")
-                stop_event.wait(60)
-                continue
 
             bias = state.bias
 
             # Step 2: Asia extreme
-            if state.asia_extreme is None and now.hour >= 8:
-                asia = get_asia_extreme(df_5m, bias, today)
-                if asia is not None:
-                    _update_state(chat_id, "GBP/USD", asia_extreme=asia)
-                    level_label = "Low" if bias == 1 else "High"
-                    notify_fn(
-                        f"📍 <b>GBP/USD Asia Level Marked</b>\n"
-                        f"Asia {level_label}: <b>{asia:.5f}</b>\n"
-                        f"Watching for {'below' if bias==1 else 'above'} sweep in London/NY."
-                    )
-                stop_event.wait(60)
-                continue
-
             if state.asia_extreme is None:
-                stop_event.wait(60)
-                continue
+                if now.hour < 8:
+                    stop_event.wait(60)
+                    continue
+                asia = get_asia_extreme(df_5m, bias, today)
+                if asia is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "GBP/USD", asia_extreme=asia)
+                level_label = "Low" if bias == 1 else "High"
+                notify_fn(
+                    f"📍 <b>GBP/USD Asia Level Marked</b>\n"
+                    f"Asia {level_label}: <b>{asia:.5f}</b>\n"
+                    f"Watching for {'below' if bias==1 else 'above'} sweep in London/NY."
+                )
+                # Fall through immediately to next step
 
             # Step 3: Sweep
             if state.sweep is None:
@@ -1063,37 +1353,38 @@ def _gbpusd_loop(
                     stop_event.wait(60)
                     continue
                 sweep = find_sweep(df_5m, state.asia_extreme, bias, trade_date=today)
-                if sweep is not None:
-                    _update_state(chat_id, "GBP/USD", sweep=sweep)
-                    notify_fn(
-                        f"🎯 <b>GBP/USD Asia Level Swept!</b>\n"
-                        f"Sweep @ <b>{sweep['sweep_price']:.5f}</b> "
-                        f"(Asia level: {state.asia_extreme:.5f})\n"
-                        f"Fib range: {sweep['fib_low']:.5f} – {sweep['fib_high']:.5f}\n"
-                        f"Watching for bounce to 0.079 fakeout zone "
-                        f"({fib_price(sweep['fib_high'], sweep['fib_low'], 0.079):.5f}+)."
-                    )
-                stop_event.wait(60)
-                continue
+                if sweep is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "GBP/USD", sweep=sweep)
+                notify_fn(
+                    f"🎯 <b>GBP/USD Asia Level Swept!</b>\n"
+                    f"Sweep @ <b>{sweep['sweep_price']:.5f}</b> "
+                    f"(Asia level: {state.asia_extreme:.5f})\n"
+                    f"Fib range: {sweep['fib_low']:.5f} – {sweep['fib_high']:.5f}\n"
+                    f"Watching for bounce to 0.079 fakeout zone "
+                    f"({fib_price(sweep['fib_high'], sweep['fib_low'], 0.079):.5f}+)."
+                )
+                # Fall through immediately to next step
 
             sweep = state.sweep
 
-            # Step 4: Fakeout zone — scan all bars since the sweep so a bounce
-            # that already happened is detected immediately on mid-day /trade start.
+            # Step 4: Fakeout zone
             current_price = float(df_5m["close"].iloc[-1])
             if not state.fakeout_reached:
-                if scan_fakeout_zone(df_5m, sweep, bias):
-                    _update_state(chat_id, "GBP/USD", fakeout_reached=True)
-                    from config import FAKEOUT_ZONE_LEVEL
-                    fib_zone = fib_price(sweep["fib_high"], sweep["fib_low"], FAKEOUT_ZONE_LEVEL)
-                    notify_fn(
-                        f"⚡ <b>GBP/USD In Fakeout Zone!</b>\n"
-                        f"Price reached {FAKEOUT_ZONE_LEVEL:.3f} zone "
-                        f"({fib_zone:.5f}+).\n"
-                        f"Watching for 5min fractal BoS {'up' if bias==1 else 'down'}."
-                    )
-                stop_event.wait(60)
-                continue
+                if not scan_fakeout_zone(df_5m, sweep, bias):
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "GBP/USD", fakeout_reached=True)
+                from config import FAKEOUT_ZONE_LEVEL
+                fib_zone = fib_price(sweep["fib_high"], sweep["fib_low"], FAKEOUT_ZONE_LEVEL)
+                notify_fn(
+                    f"⚡ <b>GBP/USD In Fakeout Zone!</b>\n"
+                    f"Price reached {FAKEOUT_ZONE_LEVEL:.3f} zone "
+                    f"({fib_zone:.5f}+).\n"
+                    f"Watching for 5min fractal BoS {'up' if bias==1 else 'down'}."
+                )
+                # Fall through immediately to next step
 
             # Step 5: 5min BoS
             if state.bos is None:
@@ -1101,15 +1392,16 @@ def _gbpusd_loop(
                     stop_event.wait(60)
                     continue
                 bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
-                if bos is not None:
-                    _update_state(chat_id, "GBP/USD", bos=bos)
-                    notify_fn(
-                        f"✅ <b>GBP/USD 5min BoS Confirmed!</b>\n"
-                        f"Swing: {bos['swing_low']:.5f} – {bos['swing_high']:.5f}\n"
-                        f"Watching for price to enter Goldilocks zone (0.236–0.764 fib)."
-                    )
-                stop_event.wait(30)
-                continue
+                if bos is None:
+                    stop_event.wait(30)
+                    continue
+                _update_state(chat_id, "GBP/USD", bos=bos)
+                notify_fn(
+                    f"✅ <b>GBP/USD 5min BoS Confirmed!</b>\n"
+                    f"Swing: {bos['swing_low']:.5f} – {bos['swing_high']:.5f}\n"
+                    f"Watching for price to enter Goldilocks zone (0.236–0.764 fib)."
+                )
+                # Fall through immediately to step 6
 
             bos = state.bos
 
@@ -1255,6 +1547,292 @@ def _execute_paper_gbpusd(
     finally:
         with _lock_gbpusd:
             _active_gbpusd.pop(chat_id, None)
+
+    if not won:
+        with _state_lock:
+            state.losses_today += 1
+
+    stop_event.wait(60)
+
+
+def _eurusd_loop(
+    chat_id:    str,
+    account:    dict,
+    notify_fn,
+    stop_event: threading.Event,
+) -> None:
+    from analysis.sessions import is_market_open, is_gold_session, is_friday_close_time
+    from data.twelvedata import fetch_all_timeframes
+    from signals.engine import (
+        detect_4h_bos, get_asia_extreme, find_sweep,
+        scan_fakeout_zone, find_5min_bos, build_signal, fib_price,
+    )
+    from analysis.sessions import get_current_session
+
+    logger.info(f"[eurusd] loop started for {chat_id}")
+
+    while not stop_event.is_set():
+        try:
+            now   = datetime.now(timezone.utc)
+            today = now.date()
+            state = _get_state(chat_id, "EUR/USD", today)
+
+            if not is_market_open(symbol="EUR/USD"):
+                stop_event.wait(60)
+                continue
+
+            if chat_id in _active_eurusd:
+                stop_event.wait(_POLL_SECS)
+                continue
+
+            if state.trades_today >= MAX_TRADES_PER_DAY:
+                stop_event.wait(300)
+                continue
+
+            if state.opening_balance and state.losses_today > 0:
+                balance = fetch_balance(
+                    account["metaapi_account_id"],
+                    account["password"],
+                    account.get("server", "practice"),
+                ) or state.opening_balance
+                drawdown = (state.opening_balance - balance) / state.opening_balance
+                if drawdown >= DAILY_LOSS_LIMIT_PCT:
+                    notify_fn(
+                        f"EUR/USD daily loss limit hit ({drawdown:.1%}) — "
+                        f"paused for today."
+                    )
+                    stop_event.wait(3600)
+                    continue
+
+            try:
+                from config import TIMEFRAMES
+                candles = fetch_all_timeframes(TIMEFRAMES, symbol="EUR/USD", account=account)
+            except Exception as e:
+                wait = 300 if "resets in" in str(e) else 30
+                stop_event.wait(wait)
+                continue
+
+            df_4h = candles.get("4h")
+            df_5m = candles.get("5min")
+            if df_4h is None or df_5m is None:
+                stop_event.wait(60)
+                continue
+
+            if state.bias == 0 and now.hour >= 8:
+                _bootstrap_state(chat_id, "EUR/USD", df_4h, df_5m, notify_fn)
+                state = _get_state(chat_id, "EUR/USD", today)
+                if state.bias == 0:
+                    stop_event.wait(_GOLD_SIGNAL_SECS)
+                    continue
+
+            bias = state.bias
+
+            if state.asia_extreme is None:
+                if now.hour < 8:
+                    stop_event.wait(60)
+                    continue
+                asia = get_asia_extreme(df_5m, bias, today)
+                if asia is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "EUR/USD", asia_extreme=asia)
+                level_label = "Low" if bias == 1 else "High"
+                notify_fn(
+                    f"EUR/USD Asia Level Marked\n"
+                    f"Asia {level_label}: {asia:.5f}\n"
+                    f"Watching for {'below' if bias==1 else 'above'} sweep in London/NY."
+                )
+
+            if state.sweep is None:
+                if not is_gold_session(now):
+                    stop_event.wait(60)
+                    continue
+                sweep = find_sweep(df_5m, state.asia_extreme, bias, trade_date=today)
+                if sweep is None:
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "EUR/USD", sweep=sweep)
+                notify_fn(
+                    f"EUR/USD Asia Level Swept!\n"
+                    f"Sweep @ {sweep['sweep_price']:.5f} "
+                    f"(Asia level: {state.asia_extreme:.5f})\n"
+                    f"Fib range: {sweep['fib_low']:.5f} - {sweep['fib_high']:.5f}\n"
+                    f"Watching for bounce to fakeout zone."
+                )
+
+            sweep = state.sweep
+
+            current_price = float(df_5m["close"].iloc[-1])
+            if not state.fakeout_reached:
+                if not scan_fakeout_zone(df_5m, sweep, bias):
+                    stop_event.wait(60)
+                    continue
+                _update_state(chat_id, "EUR/USD", fakeout_reached=True)
+                from config import FAKEOUT_ZONE_LEVEL
+                fib_zone = fib_price(sweep["fib_high"], sweep["fib_low"], FAKEOUT_ZONE_LEVEL)
+                notify_fn(
+                    f"EUR/USD In Fakeout Zone!\n"
+                    f"Price reached {FAKEOUT_ZONE_LEVEL:.3f} zone ({fib_zone:.5f}+).\n"
+                    f"Watching for 5min fractal BoS {'up' if bias==1 else 'down'}."
+                )
+
+            if state.bos is None:
+                if not is_gold_session(now):
+                    stop_event.wait(60)
+                    continue
+                bos = find_5min_bos(df_5m, bias, start_time=sweep.get("sweep_time"))
+                if bos is None:
+                    stop_event.wait(30)
+                    continue
+                _update_state(chat_id, "EUR/USD", bos=bos)
+                notify_fn(
+                    f"EUR/USD 5min BoS Confirmed!\n"
+                    f"Swing: {bos['swing_low']:.5f} - {bos['swing_high']:.5f}\n"
+                    f"Watching for price to enter Goldilocks zone (0.236-0.764 fib)."
+                )
+
+            bos = state.bos
+
+            if not is_gold_session(now):
+                stop_event.wait(60)
+                continue
+
+            if is_friday_close_time(now):
+                stop_event.wait(300)
+                continue
+
+            session = get_current_session(now)
+            signal = build_signal(
+                current_price, bos, bias, session, "EUR/USD",
+                state.asia_extreme, sweep["fib_high"], sweep["fib_low"],
+            )
+
+            if signal is None:
+                stop_event.wait(30)
+                continue
+
+            balance = fetch_balance(
+                account["metaapi_account_id"],
+                account["password"],
+                account.get("server", "practice"),
+            )
+            if balance is None:
+                stop_event.wait(30)
+                continue
+
+            if state.opening_balance is None:
+                _update_state(chat_id, "EUR/USD", opening_balance=balance)
+
+            if EURUSD_PAPER_TRADE:
+                _execute_paper_eurusd(
+                    chat_id=chat_id, notify_fn=notify_fn,
+                    stop_event=stop_event, signal=signal, state=state,
+                )
+            else:
+                lot = float(account.get("lot_size") or 0) or _calculate_lot_eurusd(
+                    balance, signal.sl_pips
+                )
+                _execute_trade(
+                    symbol      = "EUR/USD",
+                    oanda_instr = OANDA_EURUSD_SYMBOL,
+                    chat_id     = chat_id,
+                    account     = account,
+                    notify_fn   = notify_fn,
+                    stop_event  = stop_event,
+                    signal      = signal,
+                    active_dict = _active_eurusd,
+                    active_lock = _lock_eurusd,
+                    lot         = lot,
+                    state       = state,
+                    balance     = balance,
+                )
+
+            _update_state(chat_id, "EUR/USD",
+                sweep=None, fakeout_reached=False, bos=None)
+
+        except Exception as e:
+            logger.exception(f"[eurusd] loop error for {chat_id}: {e}")
+            stop_event.wait(30)
+
+    logger.info(f"[eurusd] loop stopped for {chat_id}")
+    with _auto_lock:
+        _auto_stop_eurusd.pop(chat_id, None)
+
+
+def _execute_paper_eurusd(
+    chat_id:    str,
+    notify_fn,
+    stop_event: threading.Event,
+    signal,
+    state:      _TapBarrelState,
+) -> None:
+    from data.twelvedata import fetch_price
+
+    with _state_lock:
+        state.trades_today += 1
+
+    log_id = _log_open(
+        chat_id="paper", symbol="EUR/USD", direction=signal.direction,
+        lot=0.0, entry=signal.entry, sl=signal.sl, tp=signal.tp,
+        rr=2.0, session=signal.session_name, signal=signal,
+    )
+
+    notify_fn(
+        f"Paper Trade #{log_id} EUR/USD (Demo)\n"
+        f"Direction:  {signal.direction}\n"
+        f"Entry:      {signal.entry:.5f}\n"
+        f"SL:         {signal.sl:.5f}\n"
+        f"TP (2RR):   {signal.tp:.5f}\n"
+        f"Session:    {signal.session_emoji} {signal.session_name}\n"
+        f"Paper trade - tracking SL/TP on real EUR/USD price"
+    )
+
+    with _lock_eurusd:
+        _active_eurusd[chat_id] = _OpenTrade(
+            chat_id=chat_id, trade_id=f"paper-eurusd-{log_id}",
+            direction=signal.direction, entry=signal.entry,
+            sl=signal.sl, tp=signal.tp, lot=0.0,
+            log_id=log_id, start_time=time.time(), symbol="EUR/USD",
+        )
+
+    start_time = time.time()
+    won = False
+
+    try:
+        while not stop_event.is_set():
+            stop_event.wait(_POLL_SECS)
+            current_price = fetch_price("EUR/USD")
+            if current_price is None:
+                continue
+
+            time_held = time.time() - start_time
+            sl_hit = (
+                (signal.direction == "BUY"  and current_price <= signal.sl) or
+                (signal.direction == "SELL" and current_price >= signal.sl)
+            )
+            tp_hit = (
+                (signal.direction == "BUY"  and current_price >= signal.tp) or
+                (signal.direction == "SELL" and current_price <= signal.tp)
+            )
+
+            if tp_hit or sl_hit:
+                price_move = current_price - signal.entry
+                if signal.direction == "SELL":
+                    price_move = -price_move
+                final_pnl = round(price_move, 5)
+                won       = final_pnl > 0
+                icon      = "Win" if won else "Loss"
+                reason    = "profit" if won else "stoploss"
+                _log_close(log_id, final_pnl, reason)
+                notify_fn(
+                    f"{icon} Paper Trade #{log_id} Closed EUR/USD\n"
+                    f"P&L: {'+'if won else ''}{final_pnl:.5f}  |  Held: {time_held/60:.0f}m\n"
+                    f"{signal.direction} @ {signal.entry:.5f} -> {current_price:.5f}"
+                )
+                break
+    finally:
+        with _lock_eurusd:
+            _active_eurusd.pop(chat_id, None)
 
     if not won:
         with _state_lock:

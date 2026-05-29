@@ -631,6 +631,7 @@ def analyze_snapshot(
     result["step"] = 5
 
     # Step 6 — entry zone
+    current_price = float(df_5m["close"].iloc[-1])
     session = get_current_session()
     signal = build_signal(
         current_price, bos, bias, session, symbol,

@@ -109,6 +109,11 @@ ETH_LOT_CAPS     = [
     (400,  800,  0.02),
     (800,  float("inf"), 0.05),
 ]
+US30_LOT_CAPS    = [
+    (0,    400,  0.01),
+    (400,  800,  0.02),
+    (800,  float("inf"), 0.05),
+]
 
 # Minimum SL distance — rejects noise setups where the 5min swing is too narrow
 BTC_MIN_SL_DIST    = float(os.getenv("BTC_MIN_SL_DIST",    "400.0"))

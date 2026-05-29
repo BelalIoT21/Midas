@@ -11,8 +11,12 @@ Run: python backtest.py
 import sys
 import os
 import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+_CACHE_DIR = Path(__file__).parent / "data" / "cache"
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 import requests
 import pandas as pd
@@ -25,7 +29,10 @@ from config import (
     ATR_SL_MULT, ATR_TP1_MULT, ATR_TP2_MULT,
     MIN_CONFIDENCE, MIN_RR_RATIO,
 )
-from indicators.calculator import compute_votes, atr_value, supertrend_vote
+from indicators.calculator import (
+    compute_votes, atr_value, supertrend_vote,
+    precompute_votes, precompute_indicators,
+)
 from indicators.levels import all_levels, nearest_level
 from analysis.sessions import (
     get_current_session, session_multiplier, should_trade, is_market_open,
@@ -41,6 +48,7 @@ LOOKBACK_4H    = 220       # 4H bars — needs >=200 for EMA200 indicator
 LOOKBACK_DAILY = 100       # daily bars for trend
 MAX_HOLD       = 288       # max bars to hold (288 x 15min = 3 days)
 COOLDOWN_BARS  = 8         # 8 x 15min = 2 hours cooldown between signals
+MAX_TRADES_WEEK = 4        # 4 trades/week cap across all 6 symbols (gold gets all slots here)
 
 
 # -- Data fetching -------------------------------------------------------------
@@ -67,9 +75,9 @@ def _rate_limited_get(url: str, params: dict) -> dict:
     return resp.json()
 
 
-def _fetch_chunk(interval: str, end_dt: datetime) -> pd.DataFrame:
+def _fetch_chunk(interval: str, end_dt: datetime, symbol: str = None) -> pd.DataFrame:
     params = {
-        "symbol":     SYMBOL,
+        "symbol":     symbol or SYMBOL,
         "interval":   interval,
         "outputsize": 5000,
         "end_date":   end_dt.strftime("%Y-%m-%d %H:%M:%S"),
@@ -103,14 +111,29 @@ def _fetch_chunk(interval: str, end_dt: datetime) -> pd.DataFrame:
     )
 
 
-def fetch_historical(interval: str, start: datetime) -> pd.DataFrame:
-    end     = datetime.now(timezone.utc)
+def fetch_historical(interval: str, start: datetime, symbol: str = None) -> pd.DataFrame:
+    sym       = symbol or SYMBOL
+    slug      = sym.replace("/", "")
+    cache_path = _CACHE_DIR / f"{slug}_{interval}.parquet"
+
+    if cache_path.exists():
+        cached = pd.read_parquet(cache_path)
+        if not cached.empty:
+            cached.index = pd.to_datetime(cached.index, utc=True)
+            earliest_date = cached.index.min().date()
+            cached_slice  = cached[cached.index >= pd.Timestamp(start)]
+            if earliest_date <= start.date() and len(cached_slice) > 100:
+                print(f"  {interval}: {len(cached_slice):,} candles (cache)  "
+                      f"({cached_slice.index[0].date()} to {cached_slice.index[-1].date()})")
+                return cached_slice
+
+    end         = datetime.now(timezone.utc)
     chunks: list[pd.DataFrame] = []
     current_end = end
 
-    print(f"  Fetching {interval} from {start.date()}...", end="", flush=True)
+    print(f"  Fetching {sym} {interval} from {start.date()}...", end="", flush=True)
     while True:
-        chunk = _fetch_chunk(interval, current_end)
+        chunk = _fetch_chunk(interval, current_end, sym)
         if chunk.empty:
             break
         chunks.append(chunk)
@@ -128,6 +151,8 @@ def fetch_historical(interval: str, start: datetime) -> pd.DataFrame:
 
     df = pd.concat(chunks)
     df = df[~df.index.duplicated(keep="first")].sort_index()
+    df.to_parquet(cache_path)
+
     df = df[df.index >= pd.Timestamp(start)]
     print(f"  {interval}: {len(df):,} candles  "
           f"({df.index[0].date()} to {df.index[-1].date()})")
@@ -425,20 +450,65 @@ def _print_bounce_report(signals: list[dict], label: str) -> None:
     print(f"{'='*w}\n")
 
 
+# -- Per-symbol config ---------------------------------------------------------
+
+# session_fn: which sessions to trade | trade_dir: "SELL"/"BUY"/"BOTH"
+SYMBOL_CONFIGS: dict = {
+    # XAU: SELL-only London — grid-tuned
+    "XAU/USD": dict(
+        slug="XAUUSD", trade_dir="SELL",
+        session_fn=lambda s: s.quality == "best" and s.name == "London",
+        confidence=0.70, momentum_thresh=-0.5, consensus=7, st_stable=2,
+    ),
+    # BTC: SELL-only, London+Overlap — tighter confidence to compensate relaxed 1H ST
+    "BTC/USD": dict(
+        slug="BTCUSD", trade_dir="SELL",
+        session_fn=lambda s: s.quality == "best",
+        confidence=0.74, momentum_thresh=-1.5, consensus=7, st_stable=2,
+    ),
+    # ETH: SELL-only, London+Overlap — grid-tuned
+    "ETH/USD": dict(
+        slug="ETHUSD", trade_dir="SELL",
+        session_fn=lambda s: s.quality == "best",
+        confidence=0.70, momentum_thresh=-2.0, consensus=6, st_stable=2,
+    ),
+    # US30: BUY-only, NY session — grid-tuned (Dow was bullish 2024-26)
+    "US30": dict(
+        slug="US30", trade_dir="BUY",
+        session_fn=lambda s: s.name in ("London/NY Overlap", "New York"),
+        confidence=0.70, momentum_thresh=-0.8, consensus=6, st_stable=2,
+    ),
+    # EUR/USD: BOTH, London+Overlap — 46.1% WR (grid-tuned)
+    "EUR/USD": dict(
+        slug="EURUSD", trade_dir="BOTH",
+        session_fn=lambda s: s.quality == "best",
+        confidence=0.72, momentum_thresh=-0.2, consensus=7, st_stable=3,
+    ),
+    # GBP/USD: BUY-only, London+Overlap — 47.6% WR (grid-tuned, GBP was bullish)
+    "GBP/USD": dict(
+        slug="GBPUSD", trade_dir="BUY",
+        session_fn=lambda s: s.quality == "best",
+        confidence=0.72, momentum_thresh=-0.08, consensus=7, st_stable=2,
+    ),
+}
+
+
 # -- Main ----------------------------------------------------------------------
 
-def run_backtest() -> None:
+def run_backtest(symbol: str = "XAU/USD") -> dict:
+    import time as _time
+    cfg         = SYMBOL_CONFIGS.get(symbol, SYMBOL_CONFIGS["XAU/USD"])
     start_fetch = START_DATE - timedelta(days=WARMUP_DAYS)
 
     print(f"\n{'='*58}")
-    print(f"  MIDAS BACKTEST  —  15min  —  Trump Era (Jan 2025+)")
-    print(f"  XAUUSD  |  {START_DATE.date()} to today")
-    print(f"  [config] MIN_CONF={MIN_CONFIDENCE}  SL={ATR_SL_MULT}x  "
-          f"TP1={ATR_TP1_MULT}x  TP2={ATR_TP2_MULT}x  RR1=1:{ATR_TP1_MULT/ATR_SL_MULT:.2f}")
+    print(f"  {symbol}  |  {START_DATE.date()} to today")
+    print(f"  dir={cfg['trade_dir']}  conf={cfg['confidence']}  "
+          f"mom={cfg['momentum_thresh']}  consensus={cfg['consensus']}  "
+          f"st_stable={cfg['st_stable']}")
     print(f"{'='*58}\n")
 
     # Fetch base 15min data (includes warmup window)
-    df_15m_full = fetch_historical("15min", start_fetch)
+    df_15m_full = fetch_historical("15min", start_fetch, symbol)
 
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     df_1h_full    = df_15m_full.resample("1h",  closed="left", label="left").agg(agg).dropna()
@@ -447,46 +517,224 @@ def run_backtest() -> None:
 
     print(f"\n  Resampled: 1H={len(df_1h_full):,}  4H={len(df_4h_full):,}  Daily={len(df_daily_full):,}")
 
-    # Only walk bars from START_DATE onwards (warmup already loaded)
-    walk_idx = df_15m_full.index.searchsorted(pd.Timestamp(START_DATE))
-    # Ensure we have enough lookback
-    walk_start = max(walk_idx, LOOKBACK_15M)
+    # ── Pre-compute all indicator series (runs each indicator once, not per bar) ──
+    t0 = _time.time()
+    print("\n  Pre-computing indicators...", end="", flush=True)
 
-    print(f"\n  Walking forward through {len(df_15m_full) - walk_start:,} bars "
+    votes_15m_full = precompute_votes(df_15m_full)
+    votes_1h_full  = precompute_votes(df_1h_full)
+    votes_4h_full  = precompute_votes(df_4h_full)
+    print(".", end="", flush=True)
+
+    ind_15m = precompute_indicators(df_15m_full)
+    ind_4h  = precompute_indicators(df_4h_full)
+    ind_1h  = precompute_indicators(df_1h_full)
+    print(".", end="", flush=True)
+
+    # Forward-fill 1H/4H series onto 15m index for O(1) bar lookups
+    idx15 = df_15m_full.index
+    votes_1h_al  = votes_1h_full.reindex(idx15, method="ffill")
+    votes_4h_al  = votes_4h_full.reindex(idx15, method="ffill")
+    atr_s        = ind_15m["atr"].reindex(idx15, method="ffill")
+    rsi4h_s      = ind_4h["rsi14"].reindex(idx15, method="ffill")
+    adx4h_s      = ind_4h["adx"].reindex(idx15, method="ffill")
+    st4h_s       = ind_4h["supertrend_dir"].reindex(idx15, method="ffill")
+    st1h_s       = ind_1h["supertrend_dir"].reindex(idx15, method="ffill")
+
+    # 4H ST stability: consecutive bars in same direction (kill fresh-flip signals)
+    _st4h_raw = ind_4h["supertrend_dir"].fillna(0)
+    _consec   = pd.Series(0, index=_st4h_raw.index)
+    for _k in range(1, len(_st4h_raw)):
+        _consec.iloc[_k] = (_consec.iloc[_k - 1] + 1
+                            if _st4h_raw.iloc[_k] == _st4h_raw.iloc[_k - 1] else 0)
+    st4h_consec_al = _consec.reindex(idx15, method="ffill").fillna(0)
+
+    print(".", end="", flush=True)
+
+    # 4H momentum: % price change over last 5 4H bars (= 20 hours)
+    # Confirms trend is ACTIVE right now, not just structurally above EMA50
+    _close4h   = df_4h_full["close"]
+    mom_4h_pct = (_close4h - _close4h.shift(5)) / _close4h.shift(5) * 100
+    mom_4h_al  = mom_4h_pct.reindex(idx15, method="ffill").fillna(0.0)
+    print(".", end="", flush=True)
+
+    # 4H EMA50 trend gate — faster than daily EMA50, catches reversals quicker
+    ema50_4h    = df_4h_full["close"].ewm(span=50, adjust=False).mean()
+    band_4h     = ema50_4h * 0.001
+    trend_4h    = pd.Series("NEUTRAL", index=df_4h_full.index, dtype=object)
+    trend_4h[df_4h_full["close"] > ema50_4h + band_4h] = "BULL"
+    trend_4h[df_4h_full["close"] < ema50_4h - band_4h] = "BEAR"
+    trend_4h_al = trend_4h.reindex(idx15, method="ffill").fillna("NEUTRAL")
+    print(".", end="", flush=True)
+
+    # Pre-compute S/R levels once per 1H bar (≈1200 calls vs 53k)
+    sr_by_1h: dict = {}
+    for k in range(LOOKBACK_1H, len(df_1h_full)):
+        win = df_1h_full.iloc[k - LOOKBACK_1H: k + 1]
+        try:
+            sr_by_1h[df_1h_full.index[k]] = all_levels(win).get("all_sr", [])
+        except Exception:
+            sr_by_1h[df_1h_full.index[k]] = []
+    print(f" done ({_time.time()-t0:.1f}s)\n")
+
+    # ── Walk setup ────────────────────────────────────────────────────────────
+    walk_idx   = df_15m_full.index.searchsorted(pd.Timestamp(START_DATE))
+    walk_start = max(walk_idx, LOOKBACK_15M)
+    total_walk = len(df_15m_full) - walk_start
+
+    print(f"  Walking forward through {total_walk:,} bars "
           f"(from {START_DATE.date()})...\n")
 
     signals:        list[dict] = []
     bounce_signals: list[dict] = []
-    last_sig:    dict[str, int] = {}   # bar index of last signal per direction
+    last_sig:    dict[str, int] = {}
     last_bounce: dict[str, int] = {}
     processed  = 0
     skipped_mh = 0
-    total_walk = len(df_15m_full) - walk_start
+    weekly_trades  = 0
+    current_week: tuple = (-1, -1)
+
+    # Cached 1H window (reused for bounce check, updated when 1H bar changes)
+    _last_1h_ts   = None
+    _cached_1h_win = None
+    _cached_daily_win = None
 
     for i in range(walk_start, len(df_15m_full)):
-        ts = df_15m_full.index[i].to_pydatetime()
+        ts    = df_15m_full.index[i].to_pydatetime()
+        ts_pd = df_15m_full.index[i]
 
-        if not is_market_open(ts):
+        if not is_market_open(ts, symbol):
             skipped_mh += 1
             continue
 
-        # Build sliding windows
-        df_15m_win = df_15m_full.iloc[i - LOOKBACK_15M + 1: i + 1]
-        df_1h_win  = df_1h_full[df_1h_full.index <= df_15m_full.index[i]].tail(LOOKBACK_1H)
-        df_4h_win  = df_4h_full[df_4h_full.index <= df_15m_full.index[i]].tail(LOOKBACK_4H)
-        df_daily_win = df_daily_full[df_daily_full.index <= df_15m_full.index[i]].tail(LOOKBACK_DAILY)
-
-        if len(df_4h_win) < 30 or len(df_daily_win) < 50:
+        # ── Fast score (all pre-computed lookups) ─────────────────────────────
+        session = get_current_session(ts)
+        if not cfg["session_fn"](session):
+            processed += 1
             continue
 
-        result = score_bar(df_15m_win, df_1h_win, df_4h_win, df_daily_win, ts)
+        v15 = votes_15m_full.iloc[i]
+        v1h = votes_1h_al.iloc[i]
+        v4h = votes_4h_al.iloc[i]
 
+        weighted_bull = 0.0
+        weighted_bear = 0.0
+        active_weight = 0
+        breakdown     = []
+        for tf, weight, vrow in [("4h", 3, v4h), ("1h", 2, v1h), ("15min", 1, v15)]:
+            for name in vrow.index:
+                vote = int(vrow[name])
+                weighted_bull += weight * max(vote, 0)
+                weighted_bear += weight * max(-vote, 0)
+                if vote != 0:
+                    active_weight += weight
+                breakdown.append((name, tf, vote))
+
+        if active_weight == 0:
+            processed += 1
+            continue
+
+        close = float(df_15m_full["close"].iat[i])
+        atr   = float(atr_s.iat[i])
+        if pd.isna(atr):
+            processed += 1
+            continue
+
+        bull_conf = weighted_bull / active_weight
+        bear_conf = weighted_bear / active_weight
+
+        # S/R boost — look up pre-computed levels for the current 1H bar
+        cur_1h_ts = votes_1h_al.index[i]  # ffilled 1H timestamp
+        sr_levels = sr_by_1h.get(cur_1h_ts, [])
+        if sr_levels:
+            near = nearest_level(close, sr_levels)
+            if near is not None:
+                if near < close:
+                    bull_conf += 0.06
+                else:
+                    bear_conf += 0.06
+
+        mult       = session_multiplier(session)
+        bull_conf *= mult
+        bear_conf *= mult
+
+        direction  = "BUY" if bull_conf >= bear_conf else "SELL"
+        confidence = bull_conf if direction == "BUY" else bear_conf
+
+        # 4H trend gate — only trade in direction of 4H EMA50
+        trend_4h_val = trend_4h_al.iat[i]
+        if direction == "BUY"  and trend_4h_val != "BULL":
+            processed += 1
+            continue
+        if direction == "SELL" and trend_4h_val != "BEAR":
+            processed += 1
+            continue
+
+        # Direction gate
+        trade_dir = cfg["trade_dir"]
+        if trade_dir == "SELL" and direction == "BUY":
+            processed += 1
+            continue
+        if trade_dir == "BUY" and direction == "SELL":
+            processed += 1
+            continue
+
+        result = None
+        if confidence >= cfg["confidence"]:
+            expected  = 1 if direction == "BUY" else -1
+            opposing  = -expected
+
+            # Filter 1: 4H ST actively confirms, 1H ST not opposing, 4H stable
+            st4    = float(st4h_s.iat[i]) if not pd.isna(st4h_s.iat[i]) else 0
+            st1    = float(st1h_s.iat[i]) if not pd.isna(st1h_s.iat[i]) else 0
+            consec = int(st4h_consec_al.iat[i])
+            ok = (st4 == expected) and (st1 != opposing) and (consec >= cfg["st_stable"])
+
+            # Filter 2: 4H momentum gate
+            if ok:
+                mom   = float(mom_4h_al.iat[i])
+                thresh = cfg["momentum_thresh"]
+                if direction == "SELL" and mom > thresh:
+                    ok = False
+                if direction == "BUY"  and mom < -thresh:
+                    ok = False
+
+            # Filter 3: ADX >= 22
+            if ok:
+                adx_v = float(adx4h_s.iat[i]) if not pd.isna(adx4h_s.iat[i]) else 25.0
+                ok = adx_v >= 22
+
+            # Filter 4: RSI guard
+            if ok:
+                rsi_v = float(rsi4h_s.iat[i]) if not pd.isna(rsi4h_s.iat[i]) else 50.0
+                if direction == "BUY"  and rsi_v > 70:
+                    ok = False
+                if direction == "SELL" and rsi_v < 30:
+                    ok = False
+
+            # Filter 5: 4H consensus
+            if ok:
+                expected = 1 if direction == "BUY" else -1
+                ok = sum(1 for _, tf, v in breakdown if tf == "4h" and v == expected) >= cfg["consensus"]
+
+            if ok:
+                result = (direction, round(min(confidence, 0.99), 4), atr, close)
+
+        # ── Cooldown / weekly cap ─────────────────────────────────────────────
         if result is not None:
             direction, confidence, atr, close = result
-            last_bar = last_sig.get(direction, -9999)
-            if (i - last_bar) < COOLDOWN_BARS:
+            if (i - last_sig.get(direction, -9999)) < COOLDOWN_BARS:
                 result = None
 
+        if result is not None and weekly_trades >= MAX_TRADES_WEEK:
+            result = None
+
+        this_week = (ts.isocalendar()[0], ts.isocalendar()[1])
+        if this_week != current_week:
+            current_week  = this_week
+            weekly_trades = 0
+
+        # ── Record trade ──────────────────────────────────────────────────────
         if result is not None:
             direction, confidence, atr, close = result
             last_sig[direction] = i
@@ -499,6 +747,7 @@ def run_backtest() -> None:
             rr1   = round(tp1_d / sl_d, 2)
 
             if rr1 >= MIN_RR_RATIO:
+                weekly_trades += 1
                 df_future = df_15m_full.iloc[i + 1: i + 1 + MAX_HOLD]
                 outcome, bars_held = resolve_trade(df_future, direction, sl, tp1)
                 signals.append({
@@ -516,27 +765,33 @@ def run_backtest() -> None:
                     "session":    get_current_session(ts).name,
                 })
 
-        # -- Bounce signal check -----------------------------------------------
+        # ── Bounce signal check ───────────────────────────────────────────────
         try:
             from signals.sr_bounce import detect_bounce
-            bounce = detect_bounce(df_1h_win, df_daily_win, ts)
+            # Reuse cached 1H / daily windows — rebuild only when 1H bar changes
+            if cur_1h_ts != _last_1h_ts:
+                _last_1h_ts    = cur_1h_ts
+                _cached_1h_win = df_1h_full[df_1h_full.index <= ts_pd].tail(LOOKBACK_1H)
+                _cached_daily_win = df_daily_full[df_daily_full.index <= ts_pd].tail(LOOKBACK_DAILY)
+
+            bounce = detect_bounce(_cached_1h_win, _cached_daily_win, ts)
             if bounce is not None:
                 last_b = last_bounce.get(bounce.direction, -9999)
-                if (i - last_b) >= 24:   # 24 x 15min = 6h bounce cooldown
+                if (i - last_b) >= 24:
                     last_bounce[bounce.direction] = i
                     df_future_b = df_15m_full.iloc[i + 1: i + 1 + MAX_HOLD]
                     outcome_b, bars_b = resolve_trade(
                         df_future_b, bounce.direction, bounce.sl, bounce.tp1
                     )
                     bounce_signals.append({
-                        "ts":        ts,
-                        "direction": bounce.direction,
-                        "level":     bounce.level,
+                        "ts":         ts,
+                        "direction":  bounce.direction,
+                        "level":      bounce.level,
                         "level_type": bounce.level_type,
-                        "rr1":       bounce.rr1,
-                        "outcome":   outcome_b,
-                        "bars_held": bars_b,
-                        "session":   get_current_session(ts).name,
+                        "rr1":        bounce.rr1,
+                        "outcome":    outcome_b,
+                        "bars_held":  bars_b,
+                        "session":    get_current_session(ts).name,
                     })
         except Exception:
             pass
@@ -550,10 +805,77 @@ def run_backtest() -> None:
     print(f"\n  Done.  {processed:,} bars scanned, "
           f"{skipped_mh:,} outside market hours.")
 
-    label = "15min | Trump Era (Jan 2025+)"
+    label = f"{symbol} | 15min | {START_DATE.year}+"
     print_report(signals, label)
     _print_bounce_report(bounce_signals, label)
+    return {"symbol": symbol, "signals": signals, "bounce": bounce_signals}
+
+
+def run_all_symbols() -> None:
+    import time as _time
+    all_signals: list[dict] = []
+    all_bounce:  list[dict] = []
+
+    for sym in SYMBOL_CONFIGS:
+        try:
+            res = run_backtest(sym)
+            for s in res["signals"]:
+                s["symbol"] = sym
+            for b in res["bounce"]:
+                b["symbol"] = sym
+            all_signals.extend(res["signals"])
+            all_bounce.extend(res["bounce"])
+        except Exception as e:
+            print(f"  [skip] {sym}: {e}")
+
+    if not all_signals:
+        print("No signals across all symbols.")
+        return
+
+    w = 58
+    df = pd.DataFrame(all_signals)
+    closed  = df[df["outcome"] != "expired"]
+    wins    = closed[closed["outcome"] == "win"]
+    losses  = closed[closed["outcome"] == "loss"]
+    n_total  = len(df)
+    n_closed = len(closed)
+    n_wins   = len(wins)
+    n_losses = len(losses)
+    win_rate = round(n_wins / n_closed * 100, 1) if n_closed > 0 else 0
+    avg_rr   = float(df["rr1"].mean())
+    gross_p  = n_wins * avg_rr
+    pf       = round(gross_p / n_losses, 2) if n_losses > 0 else float("inf")
+    months   = max((df["ts"].max() - df["ts"].min()).days / 30, 1)
+
+    print(f"\n{'='*w}")
+    print(f"  COMBINED — ALL SYMBOLS")
+    print(f"{'='*w}")
+    print(f"  Total signals:   {n_total}  ({round(n_total/months,1)}/month)")
+    print(f"  Closed:          {n_closed}  (win {n_wins} / loss {n_losses})")
+    print(f"  Win rate:        {win_rate}%")
+    print(f"  Profit factor:   {pf}x  (avg R:R 1:{avg_rr:.2f})")
+    print(f"  Max consec loss: {_max_consec_loss(closed)}")
+    print(f"\n  By Symbol:")
+    for sym, grp in closed.groupby("symbol"):
+        w_ = int((grp["outcome"] == "win").sum())
+        l_ = int((grp["outcome"] == "loss").sum())
+        wr = round(w_ / (w_+l_) * 100, 1) if (w_+l_) > 0 else 0
+        pf_ = round(w_*avg_rr/l_, 2) if l_ > 0 else float("inf")
+        print(f"    {sym:10s}  {w_:3d}W/{l_:3d}L  {wr:5.1f}%  PF {pf_}")
+    print(f"{'='*w}\n")
+
+
+def _max_consec_loss(closed: pd.DataFrame) -> int:
+    streak = mx = 0
+    for o in closed.sort_values("ts")["outcome"]:
+        streak = streak + 1 if o == "loss" else 0
+        mx = max(mx, streak)
+    return mx
 
 
 if __name__ == "__main__":
-    run_backtest()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "all":
+        run_all_symbols()
+    else:
+        run_backtest("XAU/USD")

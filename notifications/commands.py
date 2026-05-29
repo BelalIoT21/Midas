@@ -55,8 +55,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Enters in 0.236–0.764 fib zone after 5min BoS confirmation\n"
         "• SL at fib 1.1 · TP at 2RR\n"
         "• 🥇 Gold: Mon–Fri 08:00–21:00 UTC\n"
-        "• 💷 GBP/USD: Mon–Fri 08:00–21:00 UTC\n"
+        "• 💷 GBP/USD + 💶 EUR/USD: Mon–Fri 08:00–21:00 UTC\n"
         "• ₿ Bitcoin: 24/7\n"
+        "• 💠 ETH: 24/7\n"
         "• Max 2 trades/day · 2% risk · 5% daily loss limit\n\n"
         f"{connect_block}\n\n"
         "Type /help to see all commands.",
@@ -91,12 +92,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{'━'*32}\n\n"
 
         "📈 <b>Auto-Trader</b>\n"
-        "/trade          — start auto-trader (Gold + GBP/USD weekdays, BTC 24/7)\n"
+        "/trade          — start auto-trader (Gold + GBP/USD + EUR/USD weekdays, BTC 24/7)\n"
         "/trade_cancel   — stop &amp; close open trade\n"
         "/tradestats     — wins, losses, avg P&amp;L\n\n"
 
         "📊 <b>Market</b>\n"
-        "/scan          — show current strategy step &amp; why bot is waiting\n"
+        "/scan [symbol] — strategy steps (gold/gbp/btc/eth/us30/eur)\n"
+        "/analyze [sym] — day review: price move, steps, signals\n"
         "/price         — live XAU/USD price\n"
         "/chart         — 1H candlestick chart\n"
         "/status        — multi-timeframe snapshot\n\n"
@@ -434,19 +436,26 @@ async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             btc_line = "BTC:      ₿ 24/7 paper trading (trains ML, no real orders)\n"
         else:
             btc_line = "BTC:      ₿ 24/7 live loop active\n"
-        from config import GBPUSD_ENABLED, GBPUSD_PAPER_TRADE
+        from config import GBPUSD_ENABLED, GBPUSD_PAPER_TRADE, EURUSD_ENABLED, EURUSD_PAPER_TRADE
         if not GBPUSD_ENABLED:
             gbp_line = "GBP/USD:  ⚠️ disabled (set GBPUSD_ENABLED=true)\n"
         elif GBPUSD_PAPER_TRADE:
             gbp_line = "GBP/USD:  💷 weekdays paper trading\n"
         else:
             gbp_line = "GBP/USD:  💷 weekdays live loop active\n"
+        if not EURUSD_ENABLED:
+            eur_line = "EUR/USD:  ⚠️ disabled (set EURUSD_ENABLED=true)\n"
+        elif EURUSD_PAPER_TRADE:
+            eur_line = "EUR/USD:  💶 weekdays paper trading\n"
+        else:
+            eur_line = "EUR/USD:  💶 weekdays live loop active\n"
         await update.message.reply_text(
             "📈 <b>Trend Trader Started</b>\n"
             f"{'━'*28}\n"
             "Strategy: Tap 'n' Barrel + SMC (6-step)\n"
             "Gold:     🥇 Mon–Fri 08:00–21:00 UTC\n"
             f"{gbp_line}"
+            f"{eur_line}"
             f"{btc_line}"
             "R:R:      2RR  |  SL at fib 1.1\n"
             "Limits:   max 2 trades/day · 2% risk · 5% daily loss limit\n\n"
@@ -519,29 +528,90 @@ async def ml_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(msg, parse_mode="HTML")
 
 
+# ── Symbol parser ─────────────────────────────────────────────────────────────
+
+_SYMBOL_ALIASES: dict[str, tuple[str, str]] = {
+    "gold":    ("XAU/USD", "🥇 Gold"),
+    "xau":     ("XAU/USD", "🥇 Gold"),
+    "xauusd":  ("XAU/USD", "🥇 Gold"),
+    "gbp":     ("GBP/USD", "💷 GBP/USD"),
+    "gbpusd":  ("GBP/USD", "💷 GBP/USD"),
+    "gbp/usd": ("GBP/USD", "💷 GBP/USD"),
+    "btc":     ("BTC/USD", "₿ BTC"),
+    "bitcoin": ("BTC/USD", "₿ BTC"),
+    "btcusd":  ("BTC/USD", "₿ BTC"),
+    "eth":     ("ETH/USD", "💠 ETH"),
+    "ethereum":("ETH/USD", "💠 ETH"),
+    "ethusd":  ("ETH/USD", "💠 ETH"),
+    "us30":    ("US30",    "📊 US30"),
+    "dow":     ("US30",    "📊 US30"),
+    "eur":     ("EUR/USD", "💶 EUR/USD"),
+    "eurusd":  ("EUR/USD", "💶 EUR/USD"),
+    "eur/usd": ("EUR/USD", "💶 EUR/USD"),
+}
+
+# Symbols that TwelveData cannot serve — must use OANDA
+_OANDA_ONLY_SYMBOLS = {"US30", "ETH/USD"}
+
+
+def _parse_symbol_arg(args: list[str] | None, default_now: bool = True) -> tuple[str, str]:
+    """Parse symbol from command args. Returns (symbol, display_label)."""
+    from datetime import datetime, timezone
+    if args:
+        key = args[0].lower().strip()
+        if key in _SYMBOL_ALIASES:
+            return _SYMBOL_ALIASES[key]
+    if default_now:
+        now = datetime.now(timezone.utc)
+        if now.weekday() == 5:   # Saturday — BTC only
+            return "BTC/USD", "₿ BTC"
+    return "XAU/USD", "🥇 Gold"
+
+
+def _fetch_candles_for_scan(
+    symbol: str,
+    chat_id: str,
+    timeframes,
+) -> dict:
+    """
+    Fetch candle data for scan/analyze commands.
+    Uses the user's OANDA account when available (no daily limit, all symbols).
+    Falls back to TwelveData for standard symbols only.
+    Raises for OANDA-only symbols (US30, ETH) if no account is linked.
+    """
+    from data.twelvedata import fetch_all_timeframes
+    from db.store import get_oanda_account
+
+    acct = get_oanda_account(chat_id)
+    if acct:
+        return fetch_all_timeframes(timeframes, symbol=symbol, account=acct)
+
+    if symbol in _OANDA_ONLY_SYMBOLS:
+        raise ValueError(
+            f"{symbol} data requires an OANDA account. "
+            f"Use /connect to link yours first."
+        )
+    return fetch_all_timeframes(timeframes, symbol=symbol)
+
+
 # ── /scan ─────────────────────────────────────────────────────────────────────
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Strategy step scanner — shows which of the 6 steps is complete/pending."""
+    """Strategy step scanner — shows which of the 6 steps is complete/pending.
+    Usage: /scan  or  /scan gold  /scan gbp  /scan btc  /scan us30
+    """
     _log_cmd(update)
     msg = await update.message.reply_text("🔍 Scanning strategy steps...")
 
     try:
         from datetime import datetime, timezone
-        from data.twelvedata import fetch_all_timeframes
-        from analysis.sessions import get_current_session, is_gold_session, is_btc_session
+        from analysis.sessions import get_current_session, is_gold_session
         from signals.engine import analyze_snapshot, fib_price
 
+        symbol, sym_label = _parse_symbol_arg(context.args)
         now     = datetime.now(timezone.utc)
         session = get_current_session(now)
         is_sunday = now.weekday() == 6
-
-        # BTC runs Mon–Sat; Gold runs Mon–Fri. On Sunday neither trades.
-        # On weekdays both run — scan whichever the user asks, default Gold on weekdays.
-        symbol = "XAU/USD"
-        sym_label = "🥇 Gold"
-        if now.weekday() == 5:   # Saturday — BTC only
-            symbol, sym_label = "BTC/USD", "₿ BTC"
 
         lines = [
             f"🔍 <b>Midas Scanner</b>  {now.strftime('%H:%M UTC')}",
@@ -550,7 +620,6 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{'━'*30}",
         ]
 
-        # Session gate check — only Sunday is a hard stop; all other hours still show analysis
         if is_sunday:
             lines.append("⏸ Sunday — no trading. BTC resumes Monday, Gold resumes Monday.")
             await msg.edit_text("\n".join(lines), parse_mode="HTML")
@@ -561,9 +630,10 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 lines.append("⏸ Outside Gold trading window (entries: Mon–Fri 08:00–21:00 UTC)")
 
-        # Fetch candles
+        # Fetch candles — uses OANDA if account linked (required for US30/ETH)
+        chat_id_str = str(update.effective_chat.id)
         try:
-            candles = fetch_all_timeframes(TIMEFRAMES, symbol=symbol)
+            candles = _fetch_candles_for_scan(symbol, chat_id_str, TIMEFRAMES)
         except Exception as e:
             lines.append(f"❌ Data fetch failed: {e}")
             await msg.edit_text("\n".join(lines), parse_mode="HTML")
@@ -573,7 +643,8 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         price = float(df_5m["close"].iloc[-1]) if df_5m is not None and not df_5m.empty else 0
 
         if price:
-            lines.append(f"💰 <b>${price:,.2f}</b>  {symbol}")
+            fmt = f"${price:,.2f}" if symbol not in ("GBP/USD", "EUR/USD") else f"{price:.5f}"
+            lines.append(f"💰 <b>{fmt}</b>  {symbol}")
         lines.append("")
 
         # Run the snapshot analyzer
@@ -634,7 +705,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append(f"   BoS swing: ${bos['swing_low']:,.2f}–${bos['swing_high']:,.2f}")
             lines.append(f"   Goldilocks: ${entry_deep:,.2f}–${entry_shal:,.2f}")
 
-        logger.info(f"[cmd] /scan | chat={update.effective_chat.id} | step={step} reason={result['reason']}")
+        logger.info(f"[cmd] /scan | chat={update.effective_chat.id} | {symbol} step={step} reason={result['reason']}")
         await msg.edit_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
@@ -642,16 +713,211 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text(f"❌ Scan error: {e}")
 
 
+# ── /analyze ──────────────────────────────────────────────────────────────────
+
+async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Day-in-review analysis — reads the whole day, shows each step, signals, outcome.
+    Usage: /analyze  or  /analyze gold  /analyze gbp  /analyze us30  etc.
+    """
+    _log_cmd(update)
+    msg = await update.message.reply_text("📈 Analyzing today's price action...")
+
+    try:
+        import pandas as pd
+        from datetime import datetime, timezone
+        from signals.engine import (
+            analyze_snapshot, fib_price, detect_4h_bos, build_signal,
+        )
+        from analysis.sessions import get_current_session
+
+        symbol, sym_label = _parse_symbol_arg(context.args)
+        now   = datetime.now(timezone.utc)
+        today = now.date()
+
+        chat_id_str = str(update.effective_chat.id)
+        candles = _fetch_candles_for_scan(symbol, chat_id_str, TIMEFRAMES)
+        df_5m = candles.get("5min")
+        df_4h = candles.get("4h")
+
+        if df_5m is None or df_4h is None or df_5m.empty:
+            await msg.edit_text("❌ Could not fetch candle data.")
+            return
+
+        # Today's candles (UTC date)
+        idx_utc = df_5m.index.tz_convert("UTC") if df_5m.index.tz else pd.to_datetime(df_5m.index, utc=True)
+        today_mask = pd.Index(idx_utc.date) == today
+        today_5m   = df_5m[today_mask]
+
+        lines = [
+            f"📈 <b>Midas Day Analysis — {sym_label}</b>",
+            f"{'━'*30}",
+            f"📅 {today.strftime('%A %d %b %Y')}  {now.strftime('%H:%M UTC')}",
+            "",
+        ]
+
+        if today_5m.empty:
+            lines.append("No candle data for today yet.")
+            await msg.edit_text("\n".join(lines), parse_mode="HTML")
+            return
+
+        # Day price range
+        day_high  = float(today_5m["high"].max())
+        day_low   = float(today_5m["low"].min())
+        day_open  = float(today_5m["open"].iloc[0])
+        day_close = float(today_5m["close"].iloc[-1])
+        day_move  = day_close - day_open
+        move_icon = "📈" if day_move >= 0 else "📉"
+        pf = "${:,.2f}" if symbol not in ("GBP/USD", "EUR/USD") else "{:.5f}"
+
+        def fp(v: float) -> str:
+            return pf.format(v)
+
+        lines += [
+            f"💰 <b>Price Range</b>",
+            f"   Open:  {fp(day_open)}",
+            f"   High:  {fp(day_high)}  |  Low: {fp(day_low)}",
+            f"   Now:   {fp(day_close)}  {move_icon} ({'+' if day_move >= 0 else ''}{fp(abs(day_move))})",
+            f"   Range: {fp(day_high - day_low)}",
+            "",
+        ]
+
+        # Run full analysis on current candle data
+        result = analyze_snapshot(candles, symbol=symbol)
+        bias   = result["bias"]
+        bias_label = "BULLISH 📈" if bias == 1 else ("BEARISH 📉" if bias == -1 else "NEUTRAL ↔️")
+        lines.append(f"<b>4H Bias:</b> {bias_label}")
+        lines.append("")
+        lines.append("<b>Strategy Steps Today:</b>")
+
+        # Step 2: Asia level
+        al = result["asia_level"]
+        if al:
+            asia_tag = "Low" if bias == 1 else "High"
+            lines.append(f"✅ Asia {asia_tag}: {fp(al)}")
+        else:
+            lines.append("⬜ Asia level: not marked yet (00:00–08:00 UTC)")
+
+        # Step 3: Sweep
+        sw = result["sweep"]
+        if sw:
+            sweep_ts = sw.get("sweep_time")
+            t_str = ""
+            if sweep_ts:
+                st = pd.Timestamp(sweep_ts)
+                if st.tzinfo is None:
+                    st = st.tz_localize("UTC")
+                else:
+                    st = st.tz_convert("UTC")
+                t_str = f" ({st.strftime('%H:%M UTC')})"
+            lines.append(f"✅ Swept{t_str}: {fp(sw['sweep_price'])}  fib {fp(sw['fib_low'])}–{fp(sw['fib_high'])}")
+        else:
+            lines.append(f"⬜ Sweep: not yet")
+
+        # Step 4: Fakeout zone
+        fakeout = result["fakeout"]
+        lines.append(f"{'✅' if fakeout else '⬜'} Fakeout zone: {'reached ✓' if fakeout else 'not yet'}")
+
+        # Step 5: 5min BoS
+        bos = result["bos"]
+        if bos:
+            try:
+                bos_ts = df_5m.index[bos["idx"]]
+                if hasattr(bos_ts, "tz_convert"):
+                    bos_ts = bos_ts.tz_convert("UTC")
+                t_str = f" ({pd.Timestamp(bos_ts).strftime('%H:%M UTC')})"
+            except Exception:
+                t_str = ""
+            lines.append(f"✅ 5min BoS{t_str}: {fp(bos['swing_low'])}–{fp(bos['swing_high'])}")
+        else:
+            lines.append("⬜ 5min BoS: not yet")
+
+        lines.append("")
+
+        # Step 6: Signal / outcome
+        sig = result["signal"]
+        if sig:
+            lines += [
+                f"🚨 <b>SIGNAL — {sig.direction}</b>",
+                f"   Entry: <b>{fp(sig.entry)}</b>",
+                f"   SL:    {fp(sig.sl)}  (−{fp(sig.sl_pips)})",
+                f"   TP:    {fp(sig.tp)}  (+{fp(sig.tp_pips)})  {sig.rr}RR",
+            ]
+            # Walk bars from BoS forward to check outcome
+            if bos:
+                try:
+                    future = df_5m.iloc[bos["idx"]:]
+                    tp_hit = sl_hit = False
+                    for _, bar in future.iterrows():
+                        if sig.direction == "BUY":
+                            if float(bar["high"]) >= sig.tp:
+                                tp_hit = True; break
+                            if float(bar["low"]) <= sig.sl:
+                                sl_hit = True; break
+                        else:
+                            if float(bar["low"]) <= sig.tp:
+                                tp_hit = True; break
+                            if float(bar["high"]) >= sig.sl:
+                                sl_hit = True; break
+                    if tp_hit:
+                        lines.append(f"   ✅ <b>TP hit</b> — {fp(sig.tp)}")
+                    elif sl_hit:
+                        lines.append(f"   ❌ <b>SL hit</b> — {fp(sig.sl)}")
+                    else:
+                        lines.append(f"   ⏳ Still in play — current: {fp(day_close)}")
+                except Exception:
+                    pass
+        elif bos:
+            # BoS confirmed but not yet in entry zone — show the zone
+            try:
+                from config import ENTRY_ZONE_DEEP, ENTRY_ZONE_SHALLOW
+                zone_deep  = fib_price(bos["swing_high"], bos["swing_low"], ENTRY_ZONE_DEEP)
+                zone_shal  = fib_price(bos["swing_high"], bos["swing_low"], ENTRY_ZONE_SHALLOW)
+            except Exception:
+                zone_deep  = fib_price(bos["swing_high"], bos["swing_low"], 0.764)
+                zone_shal  = fib_price(bos["swing_high"], bos["swing_low"], 0.236)
+            lines.append(
+                f"⏳ BoS confirmed — waiting for entry zone\n"
+                f"   Goldilocks: {fp(zone_deep)}–{fp(zone_shal)}\n"
+                f"   Current:    {fp(day_close)}"
+            )
+            # Check if price passed through the zone at any point today
+            for _, bar in today_5m.iterrows():
+                session = get_current_session(bar.name.to_pydatetime())
+                test_sig = build_signal(
+                    float(bar["close"]), bos, bias, session, symbol,
+                    al or 0.0,
+                    sw["fib_high"] if sw else bos["swing_high"],
+                    sw["fib_low"]  if sw else bos["swing_low"],
+                )
+                if test_sig:
+                    lines.append(
+                        f"\n💡 <b>Signal passed through the zone today</b>\n"
+                        f"   {test_sig.direction} opportunity @ ~{fp(test_sig.entry)}\n"
+                        f"   SL {fp(test_sig.sl)}  TP {fp(test_sig.tp)}"
+                    )
+                    break
+        else:
+            lines.append(f"⏳ {result['reason']}")
+
+        logger.info(f"[cmd] /analyze | chat={update.effective_chat.id} | {symbol} step={result['step']}")
+        await msg.edit_text("\n".join(lines), parse_mode="HTML")
+
+    except Exception as e:
+        logger.exception(f"[cmd] /analyze | chat={update.effective_chat.id} | ERROR: {e}")
+        await msg.edit_text(f"❌ Analysis error: {e}")
+
+
 # ── Command registry ──────────────────────────────────────────────────────────
 
 BOT_COMMANDS = [
     # Trend trader
-    BotCommand("trade",        "Start auto-trader (Gold + GBP/USD weekdays, BTC 24/7)"),
+    BotCommand("trade",        "Start auto-trader (Gold + GBP/USD + EUR/USD weekdays, BTC 24/7)"),
     BotCommand("trade_cancel", "Stop trend trader & close open trade"),
     BotCommand("tradestats",   "Trend trader wins, losses, avg P&L"),
     BotCommand("mlstats",      "ML model status & top trade factors"),
     # Market
-    BotCommand("scan",         "Full scanner — why Midas is/isn't trading right now"),
+    BotCommand("scan",         "Strategy scanner — /scan gold /scan gbp /scan eth /scan us30"),
+    BotCommand("analyze",      "Day review — price move, steps, signals  /analyze [symbol]"),
     BotCommand("price",        "Live XAUUSD price"),
     BotCommand("chart",        "1H candlestick chart"),
     BotCommand("status",       "Multi-timeframe snapshot"),
@@ -692,6 +958,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help",         help_cmd))
     app.add_handler(CommandHandler("price",        price_cmd))
     app.add_handler(CommandHandler("scan",         scan_cmd))
+    app.add_handler(CommandHandler("analyze",      analyze_cmd))
     app.add_handler(CommandHandler("status",       status))
     app.add_handler(CommandHandler("chart",        chart_cmd))
     app.add_handler(CommandHandler("disconnect",   disconnect_cmd))
